@@ -1,8 +1,74 @@
-# aio-sdcard-doctor
+<h1 align="center">aio-sdcard-doctor</h1>
 
-Get your photos off a failing SD card, safely.
+<p align="center"><strong>Get your photos off a failing SD card, safely.</strong><br>
+Copy, image, verify, undelete and repair, from a window, a terminal UI or plain commands.<br>
+Windows, macOS and Linux. Unpack and run: nothing to install.</p>
+
+<p align="center">
+  <a href="https://github.com/hey24sheep/aio-sdcard-doctor/actions/workflows/ci.yml"><img alt="CI status" src="https://github.com/hey24sheep/aio-sdcard-doctor/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="Licence: MIT" src="https://img.shields.io/badge/licence-MIT-1F4FD1"></a>
+</p>
+
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/gui-run-dark.png">
+    <img src="docs/images/gui-run-light.png" width="900" alt="The aio-sdcard-doctor window copying a 64 GB camera card: about two-thirds of 2,031 files are safe, with the read speed and a live speed graph">
+  </picture>
+</p>
+<p align="center"><sub>Copying a camera card. The card is only ever read. (A made-up card, for this picture.)</sub></p>
 
 `aio-sdcard-doctor` is one program for SD cards and USB drives from phones, cameras, action cams, drones and other devices. It copies everything it can read off a damaged card, makes a full backup image, checks a copy against the original, finds deleted files the way Recuva does, and carefully repairs, formats or tests a card when you ask it to. It has a window you click through (a local web page only your computer can reach), a keyboard-driven terminal UI, and plain commands for scripts.
+
+## Two ways to use it
+
+<table>
+  <tr>
+    <th width="50%">The window</th>
+    <th width="50%">The terminal UI</th>
+  </tr>
+  <tr>
+    <td>
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/gui-actions-dark.png">
+        <img src="docs/images/gui-actions-light.png" alt="The window after choosing a card: a large Copy everything off this card button, five other actions as tiles, and Card tools in a separate red box">
+      </picture>
+    </td>
+    <td>
+      <img src="docs/images/tui-actions.png" alt="The terminal UI after choosing a card: the same actions as a keyboard list, with Card tools in red">
+    </td>
+  </tr>
+  <tr>
+    <td>Double-click the program (on Windows, <code>aio-sdcard-doctor-gui.exe</code>), or run <code>aio-sdcard-doctor gui</code>. It opens a local page in your browser that only your computer can reach. It follows your light or dark theme.</td>
+    <td>Run <code>aio-sdcard-doctor tui</code>, or the program with no command in a terminal. Everything works from the keyboard. <code>--ascii</code> swaps the symbols (<code>✔ ▲ ✖ █</code>) for plain ASCII.</td>
+  </tr>
+</table>
+
+Both walk you through the same steps, and nothing starts until you have seen exactly what will happen:
+
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/gui-choices-dark.png">
+        <img src="docs/images/gui-choices-light.png" alt="What should be copied? Quick, Standard, Full, Photos only and Videos only, each with this card's file count and size">
+      </picture>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/images/gui-check-dark.png">
+        <img src="docs/images/gui-check-light.png" alt="Please check before it starts: from, to, free space before and after, how many files of each kind, and what is left out and why">
+      </picture>
+    </td>
+  </tr>
+  <tr>
+    <td><b>Choose what to copy.</b> The counts and sizes are this card's own. Anything you leave out is still listed in the report, with the reason.</td>
+    <td><b>Check, then start.</b> Where it comes from, where it goes, the free space after, and what is left out.</td>
+  </tr>
+</table>
+
+<p align="center">
+  <img src="docs/images/tui-run.png" width="760" alt="The terminal UI copying the card: 1,301 of 2,031 files safe so far, 64 percent, 29.6 MB/s">
+</p>
 
 ## Safety promises
 
