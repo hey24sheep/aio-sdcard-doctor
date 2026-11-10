@@ -66,6 +66,9 @@ func TestRealFSImages(t *testing.T) {
 				cs = 2048
 			}
 			for rel, want := range recipe(cs) {
+				if strings.HasPrefix(rel, "emoji") && strings.HasPrefix(name, "fat") {
+					continue // mtools (which builds fat*.img) stores UCS-2 only: 😀 becomes U+F600
+				}
 				ra, size, c, err := src.OpenAt(rel)
 				if err != nil {
 					t.Errorf("%s: %v", rel, err)
@@ -89,12 +92,40 @@ func TestRealFSImages(t *testing.T) {
 			}); err != nil {
 				t.Fatal(err)
 			}
-			if d := states["ELETED.JPG"]; d.State != "recoverable" || len(d.Extents) == 0 ||
-				!bytes.Equal(b[vs[0].Offset+d.Extents[0][0]:][:d.Size], fill(cs*2, "deleted")) {
-				t.Errorf("DELETED.JPG: %+v", d)
+			// Whether a deleted file's space was reused depends on the OS's allocator, so the truth
+			// is what live files occupy now: untouched → recoverable, reused → not.
+			var live [][2]int64
+			if lm, ok := src.(source.LiveMapper); ok {
+				lm.LiveExtents(context.Background(), func(_ string, off, n int64) error {
+					live = append(live, [2]int64{off, n})
+					return nil
+				})
 			}
-			if d := states["VERWR.JPG"]; d.State != "overwritten" {
-				t.Errorf("OVERWR.JPG: %+v", d)
+			reused := func(d source.Deleted) bool {
+				for _, x := range d.Extents {
+					for _, l := range live {
+						if x[0] < l[0]+l[1] && l[0] < x[0]+x[1] {
+							return true
+						}
+					}
+				}
+				return false
+			}
+			for _, k := range []struct{ key, file, tag string }{{"ELETED.JPG", "DELETED.JPG", "deleted"}, {"VERWR.JPG", "OVERWR.JPG", "overwritten"}} {
+				d, ok := states[k.key]
+				switch {
+				case !ok || len(d.Extents) == 0:
+					t.Errorf("%s not listed: %+v", k.file, d)
+				case live != nil && reused(d) && d.State == "recoverable":
+					t.Errorf("%s: space reused by a live file, but %s", k.file, d.State)
+				case live != nil && !reused(d) && d.State != "recoverable":
+					t.Errorf("%s: space untouched, but %s", k.file, d.State)
+				case d.State == "recoverable" && k.file == "DELETED.JPG" &&
+					!bytes.Equal(b[vs[0].Offset+d.Extents[0][0]:][:d.Size], fill(cs*2, k.tag)):
+					t.Errorf("%s: recovered content differs", k.file)
+				default:
+					t.Logf("%s: %s", k.file, d.State)
+				}
 			}
 		})
 	}

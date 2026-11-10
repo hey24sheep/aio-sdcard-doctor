@@ -5,8 +5,11 @@ import (
 	"errors"
 	"io"
 	"io/fs"
+	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/diskfs/go-diskfs/filesystem/fat12"
 	"github.com/diskfs/go-diskfs/filesystem/fat16"
@@ -61,14 +64,24 @@ func localTime(t time.Time) time.Time {
 }
 
 func (d *diskfsDriver) list(dir string) ([]node, error) {
-	es, err := d.fsys.ReadDir(dir)
+	es, err := d.fsys.ReadDir(d.path(dir))
 	if err != nil {
 		return nil, err
 	}
+	var real map[string]string // looked up only when a name came back mangled
 	var out []node
 	for _, e := range es {
 		if e.Name() == "." || e.Name() == ".." || e.Name() == "" {
 			continue
+		}
+		name := e.Name()
+		if strings.ContainsRune(name, utf8.RuneError) && d.raw != nil {
+			if real == nil {
+				real = d.realNames(dir)
+			}
+			if r, ok := real[name]; ok {
+				name = r
+			}
 		}
 		fi, err := e.Info()
 		if err != nil {
@@ -78,7 +91,7 @@ func (d *diskfsDriver) list(dir string) ([]node, error) {
 		if d.localTime {
 			mt = localTime(mt)
 		}
-		out = append(out, node{name: e.Name(), size: fi.Size(), mtime: mt, dir: fi.IsDir()})
+		out = append(out, node{name: name, size: fi.Size(), mtime: mt, dir: fi.IsDir()})
 	}
 	return out, nil
 }
@@ -87,7 +100,7 @@ func (d *diskfsDriver) open(name string, n node) (io.ReaderAt, io.Closer, error)
 	if n.size == 0 {
 		return emptyReader{}, nopCloser{}, nil
 	}
-	f, err := d.fsys.Open(name)
+	f, err := d.fsys.Open(d.path(name))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -96,8 +109,75 @@ func (d *diskfsDriver) open(name string, n node) (io.ReaderAt, io.Closer, error)
 		return r, f, nil
 	}
 	f.Close()
-	s := &seqReaderAt{open: func() (fs.File, error) { return d.fsys.Open(name) }}
+	s := &seqReaderAt{open: func() (fs.File, error) { return d.fsys.Open(d.path(name)) }}
 	return s, s, nil
+}
+
+// go-diskfs decodes a FAT long name one UTF-16 unit at a time, so a character outside the BMP
+// (emoji, rarer CJK; phones write them as surrogate pairs) comes back as two U+FFFD. Paths handed
+// to go-diskfs are spelled its way (diskfsPath); names it lists are repaired from our own
+// directory parser (realNames), which decodes UTF-16 properly.
+func diskfsName(s string) string {
+	astral := false
+	for _, r := range s {
+		astral = astral || r > 0xFFFF
+	}
+	if !astral {
+		return s
+	}
+	var b strings.Builder
+	for _, u := range utf16.Encode([]rune(s)) {
+		b.WriteRune(rune(u)) // a lone surrogate is written as U+FFFD, as go-diskfs does
+	}
+	return b.String()
+}
+
+// path is how go-diskfs needs p spelled: FAT only (its ISO9660 reader decodes Joliet names
+// correctly).
+func (d *diskfsDriver) path(p string) string {
+	if d.raw == nil {
+		return p
+	}
+	return diskfsPath(p)
+}
+
+func diskfsPath(p string) string {
+	segs := strings.Split(p, "/")
+	for i, s := range segs {
+		segs[i] = diskfsName(s)
+	}
+	return strings.Join(segs, "/")
+}
+
+// realNames maps go-diskfs's spelling of each live name in dir to the real name.
+func (d *diskfsDriver) realNames(dir string) map[string]string {
+	l, err := d.layout()
+	if err != nil {
+		return nil
+	}
+	raw := l.readDir(0, false)
+	for _, seg := range strings.Split(dir, "/") {
+		if seg == "" || seg == "." {
+			continue
+		}
+		found := false
+		for _, e := range l.entries(raw) {
+			if !e.deleted && e.dir && e.name == seg && l.valid(e.clus) {
+				raw, found = l.readDir(e.clus, false), true
+				break
+			}
+		}
+		if !found {
+			return nil
+		}
+	}
+	m := map[string]string{}
+	for _, e := range l.entries(raw) {
+		if !e.deleted {
+			m[diskfsName(e.name)] = e.name
+		}
+	}
+	return m
 }
 
 // seekReaderAt adapts a seekable file to io.ReaderAt (one reader at a time).

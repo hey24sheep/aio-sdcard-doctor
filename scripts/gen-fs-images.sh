@@ -37,9 +37,14 @@ fat() {
   mcopy -i "$img" "$work/a1" ::/A1.BIN; mcopy -i "$img" "$work/gap" ::/GAP.BIN; mcopy -i "$img" "$work/a2" ::/A2.BIN
   mdel -i "$img" ::/GAP.BIN
   fill "$work/frag" "$((cs * 3))" frag; mcopy -i "$img" "$work/frag" ::/FRAG.BIN          # fills the gap, continues after A2 → fragmented
-  fill "$work/del" "$((cs * 2))" deleted; mcopy -i "$img" "$work/del" ::/DELETED.JPG; mdel -i "$img" ::/DELETED.JPG   # deleted, contiguous
-  fill "$work/ow" "$cs" overwritten; mcopy -i "$img" "$work/ow" ::/OVERWR.JPG; mdel -i "$img" ::/OVERWR.JPG
-  fill "$work/new" "$cs" newer; mcopy -i "$img" "$work/new" ::/NEWER.BIN                  # reuses OVERWR's cluster
+  # Deleted files live in DEL/, where nothing is created afterwards: a new file takes the first
+  # free directory slot, which would erase a deleted record in the same folder. DELETED.JPG is
+  # deleted last, so NEWER.BIN can reuse only OVERWR.JPG's freed cluster.
+  mmd -i "$img" ::/DEL
+  fill "$work/del" "$((cs * 2))" deleted; mcopy -i "$img" "$work/del" ::/DEL/DELETED.JPG
+  fill "$work/ow" "$cs" overwritten; mcopy -i "$img" "$work/ow" ::/DEL/OVERWR.JPG; mdel -i "$img" ::/DEL/OVERWR.JPG
+  fill "$work/new" "$cs" newer; mcopy -i "$img" "$work/new" ::/NEWER.BIN
+  mdel -i "$img" ::/DEL/DELETED.JPG
   gzip -9nf "$img"
 }
 
@@ -57,9 +62,11 @@ mounted() {
   fill "$work/mnt/A1.BIN" "$cs" a1; fill "$work/mnt/GAP.BIN" "$cs" gap; fill "$work/mnt/A2.BIN" "$cs" a2; sync
   rm "$work/mnt/GAP.BIN"; sync
   fill "$work/mnt/FRAG.BIN" "$((cs * 3))" frag; sync
-  fill "$work/mnt/DELETED.JPG" "$((cs * 2))" deleted; sync; rm "$work/mnt/DELETED.JPG"; sync
-  fill "$work/mnt/OVERWR.JPG" "$cs" overwritten; sync; rm "$work/mnt/OVERWR.JPG"; sync
+  mkdir "$work/mnt/DEL"   # deleted records in their own folder (see fat above)
+  fill "$work/mnt/DEL/DELETED.JPG" "$((cs * 2))" deleted; sync
+  fill "$work/mnt/DEL/OVERWR.JPG" "$cs" overwritten; sync; rm "$work/mnt/DEL/OVERWR.JPG"; sync
   fill "$work/mnt/NEWER.BIN" "$cs" newer; sync
+  rm "$work/mnt/DEL/DELETED.JPG"; sync
   umount "$work/mnt"
   gzip -9nf "$img"
 }
