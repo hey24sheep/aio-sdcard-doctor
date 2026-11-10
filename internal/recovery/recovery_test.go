@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -397,9 +398,13 @@ func TestHostileNamesStayInside(t *testing.T) {
 		{Kind: "deleted", Path: "DCIM/_ONE.JPG", Name: "_ONE.JPG", Cat: "Photos"},
 	})
 	dests := r.plan(rows)
+	bad := `\` // ":" and "?" are legal names off Windows, and kept (paths.windowsNames)
+	if runtime.GOOS == "windows" {
+		bad = `:?\`
+	}
 	seen := map[string]bool{}
 	for i, d := range dests {
-		if !strings.HasPrefix(d, "Undeleted/") || strings.Contains(d, "..") || strings.ContainsAny(d[len("Undeleted/"):], `:?\`) {
+		if !strings.HasPrefix(d, "Undeleted/") || strings.Contains(d, "..") || strings.ContainsAny(d[len("Undeleted/"):], bad) {
 			t.Errorf("row %d → %q", i, d)
 		}
 		if seen[d] {

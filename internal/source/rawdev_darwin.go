@@ -4,7 +4,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"unsafe"
 
 	"golang.org/x/sys/unix"
 )
@@ -27,15 +26,18 @@ func OpenRawDevice(dev string) (io.ReaderAt, int64, io.Closer, error) {
 	if err != nil {
 		return nil, 0, nil, needsAdmin(err)
 	}
-	var bs uint32
-	var bc uint64
-	if _, _, e := unix.Syscall(unix.SYS_IOCTL, f.Fd(), dkiocGetBlockSize, uintptr(unsafe.Pointer(&bs))); e != 0 {
+	// libSystem's ioctl (direct syscalls are deprecated on macOS). IoctlGetInt reads into a
+	// zeroed 64-bit int: block size is a uint32 (little-endian, so the low half), block count a
+	// uint64; every Mac Go supports is 64-bit little-endian.
+	bs, err := unix.IoctlGetInt(int(f.Fd()), dkiocGetBlockSize)
+	if err != nil {
 		f.Close()
-		return nil, 0, nil, e
+		return nil, 0, nil, err
 	}
-	if _, _, e := unix.Syscall(unix.SYS_IOCTL, f.Fd(), dkiocGetBlockCount, uintptr(unsafe.Pointer(&bc))); e != 0 {
+	bc, err := unix.IoctlGetInt(int(f.Fd()), dkiocGetBlockCount)
+	if err != nil {
 		f.Close()
-		return nil, 0, nil, e
+		return nil, 0, nil, err
 	}
 	size := int64(bs) * int64(bc)
 	return NewAligned(f, int64(bs), size), size, f, nil

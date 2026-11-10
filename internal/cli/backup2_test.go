@@ -89,6 +89,9 @@ func TestRerunOffersPreviousChoice(t *testing.T) {
 // #9: no menu (with zero counts) before asking for admin rights.
 func TestNoMenuBeforeElevation(t *testing.T) {
 	dev := mockDevice() // never a real disk: the mock answers "needs admin"
+	oldAdmin := isAdmin
+	defer func() { isAdmin = oldAdmin }()
+	isAdmin = func() bool { return false } // CI runners run as Administrator
 	code, _, errOut := cli(t, true, "n\n", "rescue", "--from", dev, "--to", filepath.Join(t.TempDir(), "out"))
 	if code != ExitAdmin || strings.Contains(errOut, "What should be copied?") {
 		t.Fatalf("exit %d:\n%s", code, errOut)

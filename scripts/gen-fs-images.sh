@@ -11,7 +11,7 @@ trap 'umount -q "$work/mnt" 2>/dev/null || true; rm -rf "$work"' EXIT
 mkdir -p "$work/mnt"
 
 # fill FILE SIZE TAG — deterministic content, distinct per tag.
-fill() { yes "$3" | head -c "$2" > "$1"; }
+fill() { { yes "$3" || true; } | head -c "$2" > "$1"; }   # yes dies of SIGPIPE when head is done
 
 # The tree every image starts with (same names in every FS).
 mktree() {

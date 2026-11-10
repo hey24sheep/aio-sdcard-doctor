@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -220,6 +221,9 @@ func TestWorkerStderrDrained(t *testing.T) {
 func TestWorkerMemoryCapKills(t *testing.T) {
 	if testing.Short() {
 		t.Skip("allocates 2 GiB")
+	}
+	if testRace && runtime.GOOS == "linux" {
+		t.Skip("the Linux cap is off under the race detector (limits_linux.go); CI runs this without -race")
 	}
 	c := spawn(t, Spec{From: folder(t)}, 30*time.Second)
 	if err := c.hook("Alloc"); !errors.Is(err, source.ErrWorkerCrashed) {

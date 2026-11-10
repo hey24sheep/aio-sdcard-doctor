@@ -174,6 +174,6 @@ Use this software at your own risk. It is provided "as is", without warranty of 
 
 ## Licence
 
-MIT. Every library compiled into the program uses a permissive licence (MIT, BSD, Apache-2.0, ISC); CI enforces this, and each release ships `THIRD_PARTY_NOTICES.txt`. The OS's own tools (`chkdsk`, `format`, `diskutil`, `fsck`, `mkfs`) are called, never bundled.
+MIT. Every library compiled into the program uses a permissive licence (MIT, BSD, Apache-2.0, ISC); `scripts/notices.sh` checks this on every CI run and before every release build, and each release ships `THIRD_PARTY_NOTICES.txt`. The OS's own tools (`chkdsk`, `format`, `diskutil`, `fsck`, `mkfs`) are called, never bundled.
 
 Third-party libraries: go-diskfs, libxfat, go-ntfs (Velocidex), go-ext4-filesystem, go-mp4, mimetype, bbolt, backoff, cobra/pflag, klauspost/compress, ulikunitz/xz, x/image, x/sys, x/term, x/text, Bubble Tea, Lip Gloss and the Charm terminal libraries, termenv, go-runewidth, uniseg, and their dependencies — `THIRD_PARTY_NOTICES.txt` holds every one's full licence text (and the Go standard library's). Linux packages install it in `/usr/share/doc/aio-sdcard-doctor/`.

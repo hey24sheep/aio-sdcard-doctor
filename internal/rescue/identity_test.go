@@ -2,6 +2,7 @@ package rescue
 
 import (
 	"errors"
+	"runtime"
 	"testing"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
@@ -12,6 +13,9 @@ import (
 // worked out (the guard must not fail open). Q: stands for a card; the fake destination is
 // reported write-protected so that no test run can ever try to write anywhere real.
 func TestRawVolumeDestOnSameVolumeRefused(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip(`\\.\X: volume paths and drive letters exist only on Windows`)
+	}
 	old := physicalOf
 	defer func() { physicalOf = old }()
 	physicalOf = func(string) string { return "" }

@@ -33,7 +33,8 @@ func mockCard(t *testing.T) *fixRig {
 		lookupDrive, listDevicesFn, fix.Exec, isAdmin, fixGOOS = oldLookup, oldList, oldExec, oldAdmin, oldGOOS
 	})
 	lookupDrive = func(p string) (drives.Drive, error) {
-		if strings.EqualFold(strings.TrimRight(p, `\/`), "Q:") {
+		// off Windows "Q:" is a relative path, which the CLI makes absolute before the lookup
+		if strings.EqualFold(strings.TrimRight(p, `\/`), "Q:") || p == normFrom("Q:") {
 			return rig.vol, nil
 		}
 		return drives.Drive{Root: `C:\`, System: true, PhysicalID: "MOCK0"}, nil

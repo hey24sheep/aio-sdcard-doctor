@@ -1,16 +1,20 @@
 #!/bin/sh
-# Writes THIRD_PARTY_NOTICES.txt: the full licence text of every module built into any of the
-# release binaries (the union over all target OSes, since some dependencies are OS-specific),
-# plus the Go standard library's, which every Go binary contains.
+# Fails if any module built into the release binaries has a licence outside the permissive list,
+# then writes THIRD_PARTY_NOTICES.txt: the full licence text of every such module (the union over
+# all target OSes, since some dependencies are OS-specific), plus the Go standard library's,
+# which every Go binary contains. Run by goreleaser before a release and by CI on every push.
 set -eu
+allowed=MIT,BSD-2-Clause,BSD-3-Clause,Apache-2.0,ISC,Zlib,0BSD,Unlicense
+# MIT per its README; it ships no licence file (text in scripts/licenses)
+ignored=github.com/mattn/go-localereader
 cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -r "$tmp"' EXIT
 # built for this machine once; GOOS below only selects which dependencies are reported
-GOOS= GOARCH= go build -o "$tmp/go-licenses" github.com/google/go-licenses@v1.6.0 2>/dev/null ||
-	GOBIN="$tmp" GOOS= GOARCH= go install github.com/google/go-licenses@v1.6.0
+GOBIN="$tmp" GOOS= GOARCH= go install github.com/google/go-licenses@v1.6.0
 lic=$(ls "$tmp"/go-licenses*)
 for os in windows darwin linux; do
+	GOOS=$os "$lic" check ./... --allowed_licenses="$allowed" --ignore "$ignored"
 	GOOS=$os "$lic" report ./... --template scripts/notices.tpl >"$tmp/$os.txt" 2>"$tmp/$os.err" || {
 		cat "$tmp/$os.err" >&2
 		exit 1
