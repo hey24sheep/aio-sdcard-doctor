@@ -69,6 +69,11 @@ func devData(n int) []byte {
 }
 
 func newImage(t *testing.T, dev *fakeDev) *Image {
+	if dev.id.PhysicalID == "" {
+		// the per-card lock is machine-wide: a key shared with another test package's fake card
+		// makes them block each other. PhysicalID changes only the lock key (Matches ignores it).
+		dev.id.PhysicalID = "fake-" + t.Name()
+	}
 	out := filepath.Join(t.TempDir(), "card.img")
 	return &Image{Device: "fake", Out: out,
 		OpenDevice: func() (Device, error) { return dev, nil },

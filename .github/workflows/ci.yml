@@ -39,9 +39,9 @@ jobs:
           AIO_REAL_DEVICE_TESTS: "1" # disposable CI machines only: opens a real disk read-only
 
       # Linux only from here: they don't depend on the OS, so once is enough
-      - name: worker memory cap (off under -race on Linux)
+      - name: worker tests with the memory cap on (it is off under -race on Linux)
         if: ${{ !cancelled() && runner.os == 'Linux' }}
-        run: go test -count=1 -run TestWorkerMemoryCapKills ./internal/worker
+        run: go test -count=1 ./internal/worker
       - name: cross-compile all targets
         if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
@@ -79,6 +79,13 @@ jobs:
           sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends mtools dosfstools exfatprogs ntfs-3g e2fsprogs xorriso parted
           sudo bash scripts/gen-fs-images.sh "$RUNNER_TEMP/fsimages"
       - run: AIO_FSIMAGES="$RUNNER_TEMP/fsimages" go test -count=1 -tags realfs ./internal/fsread
+      - name: keep the images for local debugging
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: fsimages
+          path: ${{ runner.temp }}/fsimages/*.img.gz
+          retention-days: 3
 
   # checks .goreleaser.yaml still builds; only on main, where releases come from
   release-snapshot:

@@ -159,6 +159,13 @@ func Lookup(path string) (Drive, error) {
 	if err != nil {
 		return Drive{}, err
 	}
+	if m := mountOf(abs); m != "" {
+		for _, d := range ds {
+			if d.Root == m {
+				return d, nil
+			}
+		}
+	}
 	best := -1
 	for i, d := range ds {
 		if under(abs, d.Root) && (best < 0 || len(d.Root) > len(ds[best].Root)) {

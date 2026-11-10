@@ -162,7 +162,9 @@ func TestWorkerParserPanic(t *testing.T) {
 }
 
 func TestWorkerRestartBudget(t *testing.T) {
-	c := spawn(t, Spec{From: folder(t)}, 100*time.Millisecond)
+	// crashes are seen when the process exits, not by the stall timer; a short stall only made
+	// a slow start (macOS runner, -race) look like a stuck card
+	c := spawn(t, Spec{From: folder(t)}, 5*time.Second)
 	for i := 0; i < MaxRestarts; i++ {
 		if err := c.hook("Crash"); !errors.Is(err, source.ErrWorkerCrashed) {
 			t.Fatalf("crash %d: %v", i, err)

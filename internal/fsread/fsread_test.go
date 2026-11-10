@@ -105,6 +105,21 @@ func TestProbeSuperfloppy(t *testing.T) {
 	}
 }
 
+// mkfs.vfat -F 32 makes FAT32 volumes with fewer than 65,525 clusters on small cards. The boot
+// sector is a FAT32 one (16-bit FAT size 0, no fixed root directory), which is how Linux and
+// Windows tell; the cluster-count rule alone called it FAT16 and the volume couldn't be read.
+func TestSmallFAT32KnownByBootSector(t *testing.T) {
+	b, err := os.ReadFile(image(t, "fat32", 64<<20, tree(false)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs := append([]byte(nil), b[:512]...)
+	bs[13] = 64 // 64 sectors per cluster: ~2,000 clusters
+	if k := fatKind(bs); k != "fat32" {
+		t.Fatalf("fatKind = %q", k)
+	}
+}
+
 // synthetic builds a 2 MiB image whose only content is a file-system signature.
 func synthetic(off int, sig []byte) []byte {
 	b := make([]byte, 2<<20)

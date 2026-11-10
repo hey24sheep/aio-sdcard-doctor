@@ -80,7 +80,7 @@ for table in msdos gpt; do
   parted -s "$img" mklabel "$table" mkpart primary fat32 1MiB 41MiB mkpart primary 41MiB 79MiB
   loop="$(losetup -Pf --show "$img")"
   mkfs.vfat -F 32 -n PART1 "${loop}p1" >/dev/null; mkfs.exfat -L PART2 "${loop}p2" >/dev/null
-  mount "${loop}p1" "$work/mnt"; mktree "$work/mnt" 2048; umount "$work/mnt"
+  mount -o utf8 "${loop}p1" "$work/mnt"; mktree "$work/mnt" 2048; umount "$work/mnt"   # utf8: else vfat mangles हिंदी/😀
   losetup -d "$loop"; gzip -9nf "$img"
 done
 ls -l "$out"

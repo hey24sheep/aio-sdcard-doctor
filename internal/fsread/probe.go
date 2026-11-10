@@ -134,7 +134,8 @@ func fsBoot(b []byte) string {
 	return fatKind(b)
 }
 
-// fatKind validates a FAT BPB and returns fat12/fat16/fat32 by cluster count (spec rule).
+// fatKind validates a FAT BPB and returns fat32 for a FAT32 boot sector, else fat12/fat16 by
+// cluster count (spec rule).
 func fatKind(b []byte) string {
 	if len(b) < sector || b[510] != 0x55 || b[511] != 0xAA || (b[0] != 0xEB && b[0] != 0xE9) {
 		return ""
@@ -150,6 +151,7 @@ func fatKind(b []byte) string {
 		tot = int64(le.Uint32(b[32:]))
 	}
 	fatsz := int64(le.Uint16(b[22:]))
+	fat32BPB := fatsz == 0 && rootEnt == 0 // FAT32's boot sector layout, whatever the cluster count
 	if fatsz == 0 {
 		fatsz = int64(le.Uint32(b[36:]))
 	}
@@ -159,6 +161,8 @@ func fatKind(b []byte) string {
 		return ""
 	}
 	switch clusters := data / spc; {
+	case fat32BPB: // small cards formatted FAT32 (mkfs.vfat -F 32); Linux reads them by this too
+		return "fat32"
 	case clusters < 4085:
 		return "fat12"
 	case clusters < 65525:
