@@ -153,7 +153,7 @@ aio-sdcard-doctor tui     [--ascii] [--no-animation] [--no-bell]
 - [x] Compressed output (ZIP parts / `.img.xz`)
 - [x] Full backup image with ddrescue-compatible mapfile
 - [x] Verify a copy or new card (also reads old PowerShell `copy_*.csv` reports)
-- [x] Built-in read-only parsers: FAT, exFAT, NTFS, ext4, ISO9660, MBR/GPT (exFAT checked in CI against images made by the real `mkfs.exfat`)
+- [x] Built-in read-only parsers: FAT, exFAT, NTFS, ext4, ISO9660, MBR/GPT (checked in tests against images made by the real `mkfs` tools)
 - [x] Isolated reader process (stall/crash recovery, memory cap)
 - [x] Find deleted files: undelete on FAT and exFAT, deep scan for 28 format families with our own carver
 - [x] Card tools: check / repair / format with the OS's own tools, resumable health test (bad areas, fake capacity)

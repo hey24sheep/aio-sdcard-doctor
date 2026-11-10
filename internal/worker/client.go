@@ -106,7 +106,8 @@ func (c *Client) start() error {
 	c.p = p
 	c.gen++
 	var r OpenReply
-	if err := c.callLocked("W.Open", c.spec, &r, 2*c.stall); err != nil {
+	// a process start can take seconds on a busy machine; that is not a stalled card
+	if err := c.callLocked("W.Open", c.spec, &r, max(2*c.stall, 10*time.Second)); err != nil {
 		return err
 	}
 	// After a re-plug or a restart the reader must be looking at the same card (same file-system

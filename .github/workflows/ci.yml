@@ -65,8 +65,10 @@ jobs:
             done
           done
 
+  # rebuilds internal/fsread/testdata/realfs with the real mkfs tools and checks them; run by hand
+  # (Actions → ci → Run workflow) after changing scripts/gen-fs-images.sh, then commit the artifact
   fsimages:
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -78,8 +80,8 @@ jobs:
         run: |
           sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends mtools dosfstools exfatprogs ntfs-3g e2fsprogs xorriso parted
           sudo bash scripts/gen-fs-images.sh "$RUNNER_TEMP/fsimages"
-      - run: AIO_FSIMAGES="$RUNNER_TEMP/fsimages" go test -count=1 -tags realfs ./internal/fsread
-      - name: keep the images for local debugging
+      - run: AIO_FSIMAGES="$RUNNER_TEMP/fsimages" go test -count=1 -run TestRealFSImages ./internal/fsread
+      - name: keep the images (copy into internal/fsread/testdata/realfs)
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@v4
         with:

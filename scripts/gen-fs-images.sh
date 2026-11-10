@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Builds the golden file-system images used by `go test -tags realfs ./internal/fsread`.
+# Builds the golden file-system images read by TestRealFSImages (./internal/fsread); the set in
+# internal/fsread/testdata/realfs came from this script (CI job "fsimages", run by hand).
 # Dev/CI only: the GPL tools used here (mtools, dosfstools, exfatprogs, ntfs-3g, e2fsprogs,
 # xorriso) are never shipped or linked. Needs root for the exFAT/NTFS loop mounts.
 # Usage: sudo scripts/gen-fs-images.sh OUTDIR

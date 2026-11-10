@@ -1,5 +1,3 @@
-//go:build realfs
-
 package fsread
 
 import (
@@ -17,12 +15,12 @@ import (
 )
 
 // TestRealFSImages reads the images scripts/gen-fs-images.sh builds with the real mkfs tools
-// (CI job "fsimages"; AIO_FSIMAGES points at its output). This is where exFAT, and FAT/NTFS
-// written by Linux, get their golden check.
+// (testdata/realfs; AIO_FSIMAGES points at a freshly built set instead, as the CI job
+// "fsimages" does). This is where exFAT, and FAT/NTFS written by Linux, get their golden check.
 func TestRealFSImages(t *testing.T) {
 	dir := os.Getenv("AIO_FSIMAGES")
 	if dir == "" {
-		t.Skip("set AIO_FSIMAGES to the output of scripts/gen-fs-images.sh")
+		dir = filepath.Join("testdata", "realfs")
 	}
 	recipe := func(cs int) map[string][]byte {
 		return map[string][]byte{
@@ -82,8 +80,8 @@ func TestRealFSImages(t *testing.T) {
 				}
 			}
 			// deleted files the script left behind (FAT and exFAT; NTFS undelete isn't supported yet)
-			if !Capabilities(&vs[0], nil)[1].Enabled {
-				return
+			if !Capabilities(&vs[0], nil)[1].Enabled || strings.HasPrefix(name, "disk-") {
+				return // disk-* test partition tables; the script deletes nothing on them
 			}
 			states := map[string]source.Deleted{}
 			if err := src.(source.Undeleter).Deleted(context.Background(), func(d source.Deleted) error {

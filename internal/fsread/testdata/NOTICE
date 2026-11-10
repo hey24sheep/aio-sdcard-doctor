@@ -1,3 +1,7 @@
 ntfs.img.gz is test.ntfs.dd from www.velocidex.com/golang/go-ntfs v0.2.1
 (parser/test_data), Copyright Velocidex Enterprises, Apache License 2.0.
 It is used only by tests and is never shipped in the binary.
+
+realfs/*.img.gz were made by scripts/gen-fs-images.sh with mkfs.vfat, mtools, mkfs.exfat,
+mkntfs, mke2fs, xorriso and parted (run as tools, not shipped). They hold only this project's
+own test files and are used only by tests.
