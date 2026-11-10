@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>SD card doctor</title>
+<link rel="stylesheet" href="/assets/styles.css">
+<script type="module" src="/assets/app.js"></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to the current step</a>
+<header class="cardbar" id="cardbar">
+  <div class="brand">SD card doctor</div>
+  <div class="card-id" id="card-id">No card chosen</div>
+  <button type="button" class="theme" id="theme" aria-label="Colour theme: automatic">Theme</button>
+</header>
+<nav aria-label="Steps"><ol class="steps" id="steps"></ol></nav>
+<div class="layout">
+  <main id="main" tabindex="-1"></main>
+  <aside id="side" aria-label="Help for this step"></aside>
+</div>
+<div class="sr-only" aria-live="polite" id="live"></div>
+<dialog id="ask" aria-labelledby="ask-title"></dialog>
+</body>
+</html>

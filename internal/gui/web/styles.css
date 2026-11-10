@@ -1,0 +1,166 @@
+/* Calm triage room: quiet surfaces, one strong signal colour, triage colours always paired with a word. */
+:root {
+  --paper: #F2F5F3; --ink: #17212B; --steel: #5B6B78; --signal: #1F4FD1;
+  --safe: #1D7A45; --risk: #8A5300; --fail: #B42318; --on-accent: #FFFFFF;
+  --line: #C9D1CC; --raised: #FFFFFF;
+  --font: system-ui, "Segoe UI Variable", "Segoe UI", -apple-system, "SF Pro Text", Cantarell, Ubuntu, sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --paper: #121A21; --ink: #E6ECEF; --steel: #9AA8B3; --signal: #7EA2FF;
+    --safe: #4CC38A; --risk: #F0B44C; --fail: #FF7A6E; --on-accent: #121A21;
+    --line: #2C3A45; --raised: #18232C; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --paper: #121A21; --ink: #E6ECEF; --steel: #9AA8B3; --signal: #7EA2FF;
+  --safe: #4CC38A; --risk: #F0B44C; --fail: #FF7A6E; --on-accent: #121A21;
+  --line: #2C3A45; --raised: #18232C; color-scheme: dark;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--paper); color: var(--ink); font: 15px/1.5 var(--font);
+  font-variant-numeric: tabular-nums;
+}
+h1 { font-size: 28px; line-height: 1.25; margin: 0 0 8px; font-weight: 600; }
+h2 { font-size: 21px; margin: 24px 0 8px; font-weight: 600; }
+h3 { font-size: 17px; margin: 16px 0 4px; font-weight: 600; }
+p { margin: 0 0 12px; max-width: 72ch; }
+.muted { color: var(--steel); }
+.small { font-size: 13px; }
+code, .mono { font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+
+.skip { position: absolute; left: -9999px; top: 8px; background: var(--signal); color: var(--on-accent); padding: 10px 16px; z-index: 10; }
+.skip:focus { left: 16px; }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+:focus-visible { outline: 3px solid var(--signal); outline-offset: 2px; }
+
+/* card bar: who and what is being read, always visible */
+.cardbar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--raised); }
+.brand { font-weight: 600; }
+.card-id { flex: 1 1 260px; color: var(--steel); overflow-wrap: anywhere; }
+.card-id strong { color: var(--ink); }
+
+.steps { display: flex; flex-wrap: wrap; gap: 4px 18px; list-style: none; margin: 0; padding: 10px 16px; counter-reset: step; border-bottom: 1px solid var(--line); }
+.steps li { counter-increment: step; color: var(--steel); font-size: 13px; }
+.steps li::before { content: counter(step) " "; font-weight: 600; }
+.steps li[aria-current="step"] { color: var(--ink); font-weight: 600; }
+.steps li.done { color: var(--ink); }
+
+.layout { display: grid; grid-template-columns: minmax(0, 960px) minmax(240px, 320px); gap: 24px; padding: 20px 16px 48px; }
+main { min-width: 0; overflow-wrap: anywhere; } /* long paths from the card must wrap, never widen the page */
+main:focus { outline: none; }
+aside { border-left: 1px solid var(--line); padding-left: 20px; color: var(--steel); font-size: 13px; }
+aside h2 { font-size: 15px; color: var(--ink); margin-top: 0; }
+@media (max-width: 900px) {
+  .layout { grid-template-columns: minmax(0, 1fr); }
+  aside { border-left: 0; border-top: 1px solid var(--line); padding: 16px 0 0; }
+}
+
+/* controls: native, at least 44 px tall */
+button, .btn, input[type="text"], select {
+  font: inherit; min-height: 44px; border-radius: 6px;
+}
+button, .btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  padding: 8px 16px; border: 1px solid var(--line); background: var(--raised); color: var(--ink); cursor: pointer;
+  min-width: 44px;
+}
+button:hover:not(:disabled) { border-color: var(--steel); }
+button:disabled { cursor: not-allowed; color: var(--steel); background: transparent; border-style: dashed; }
+button.primary { background: var(--signal); border-color: var(--signal); color: var(--on-accent); font-weight: 600; }
+button.danger { background: var(--fail); border-color: var(--fail); color: var(--on-accent); font-weight: 600; }
+button.link { border: 0; background: none; color: var(--signal); text-decoration: underline; padding: 8px 4px; }
+input[type="text"] {
+  width: 100%; padding: 8px 12px; border: 1px solid var(--steel); background: var(--raised); color: var(--ink);
+}
+label { display: block; font-weight: 600; margin: 12px 0 4px; }
+.check { display: flex; gap: 12px; align-items: flex-start; padding: 10px 0; font-weight: 400; margin: 0; min-height: 44px; }
+.check input { width: 22px; height: 22px; margin-top: 1px; flex: none; }
+.actions-row { display: flex; flex-wrap: wrap; gap: 12px; justify-content: flex-end; margin-top: 24px; }
+
+/* drive and action cards */
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 12px; margin: 12px 0; }
+.tile { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; text-align: left; padding: 14px 16px; min-height: 96px; width: 100%; }
+.tile .title { font-weight: 600; font-size: 17px; }
+.tile .desc { color: var(--steel); font-size: 13px; font-weight: 400; }
+.tile:disabled .title { color: var(--steel); }
+.tile .why, .check .why { font-size: 13px; color: var(--risk); }
+.check:has(input:disabled) { cursor: not-allowed; } .check:has(input:disabled) strong { color: var(--steel); }
+.meter { width: 100%; height: 6px; background: var(--line); border-radius: 3px; overflow: hidden; }
+.meter > span { display: block; height: 100%; background: var(--steel); }
+.badges { display: flex; flex-wrap: wrap; gap: 6px; }
+.badge { font-size: 13px; padding: 1px 8px; border: 1px solid currentColor; border-radius: 999px; color: var(--steel); }
+.badge.good { color: var(--safe); } .badge.warn { color: var(--risk); } .badge.bad { color: var(--fail); }
+
+.quick { width: 100%; padding: 18px 20px; justify-content: space-between; text-align: left; flex-wrap: wrap; }
+.quick .title { font-size: 19px; }
+.quick .desc { color: inherit; opacity: .95; font-weight: 400; font-size: 13px; }
+.tools { margin-top: 32px; padding: 16px; border: 1px solid var(--fail); border-radius: 8px; }
+.tools h2 { color: var(--fail); margin-top: 0; }
+
+/* lists and notes */
+.choice-list { list-style: none; margin: 8px 0; padding: 0; border-top: 1px solid var(--line); }
+.choice-list li { border-bottom: 1px solid var(--line); }
+.choice-list .check { padding: 12px 4px; }
+.counts { color: var(--steel); font-size: 13px; }
+.summary { list-style: none; padding: 0; margin: 0; border-left: 3px solid var(--signal); padding-left: 14px; }
+.summary li { margin: 6px 0; overflow-wrap: anywhere; }
+.note { border: 1px solid var(--line); border-left: 4px solid var(--steel); padding: 12px 14px; border-radius: 6px; margin: 12px 0; background: var(--raised); }
+.note.warn { border-left-color: var(--risk); }
+.note.block, .note.error { border-left-color: var(--fail); }
+.note .kind { font-weight: 600; }
+.note.warn .kind { color: var(--risk); } .note.block .kind, .note.error .kind { color: var(--fail); }
+.danger-box { border: 2px solid var(--fail); border-radius: 8px; padding: 12px 16px; margin: 16px 0; }
+
+/* run */
+.hero { font-size: 28px; font-weight: 600; margin: 4px 0; }
+.bar { height: 14px; background: var(--line); border-radius: 7px; overflow: hidden; margin: 12px 0; }
+.bar > span { display: block; height: 100%; background: var(--signal); transition: width .4s; }
+.stats { display: flex; flex-wrap: wrap; gap: 8px 24px; color: var(--steel); }
+.stats b { color: var(--ink); }
+.current { font-family: var(--mono); font-size: 13px; color: var(--steel); overflow-wrap: anywhere; }
+figure { margin: 0; } figcaption { font-size: 13px; }
+svg.trace { width: 100%; height: 64px; display: block; }
+svg.trace polyline { fill: none; stroke: var(--signal); stroke-width: 2; }
+.log { max-height: 240px; overflow: auto; font-family: var(--mono); font-size: 13px; border: 1px solid var(--line); border-radius: 6px; padding: 8px; background: var(--raised); }
+.log div { overflow-wrap: anywhere; }
+
+/* results and the recover table */
+table { border-collapse: collapse; width: 100%; }
+th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-weight: 600; font-size: 13px; position: sticky; top: 0; background: var(--paper); }
+td.num, th.num { text-align: right; }
+.table-wrap { overflow: auto; max-height: 60vh; border: 1px solid var(--line); border-radius: 6px; }
+.pick { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; margin: -8px; cursor: pointer; }
+.pick input { width: 22px; height: 22px; }
+.state::before { content: "●"; margin-right: 6px; }
+.state.Excellent { color: var(--safe); } .state.Poor { color: var(--risk); } .state.Unrecoverable { color: var(--steel); }
+.state.Unrecoverable::before { content: "○"; }
+
+dialog { border: 1px solid var(--line); border-radius: 10px; padding: 20px; max-width: min(560px, 92vw); background: var(--raised); color: var(--ink); }
+dialog::backdrop { background: rgb(0 0 0 / .45); }
+dialog .actions-row { justify-content: flex-start; }
+
+.folder { border: 1px solid var(--line); border-radius: 6px; margin-top: 8px; }
+.folder .head { display: flex; gap: 8px; align-items: center; padding: 6px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.folder ul { list-style: none; margin: 0; padding: 0; max-height: 280px; overflow: auto; }
+.folder li button { width: 100%; justify-content: flex-start; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; }
+
+@media (max-width: 600px) {
+  .actions-row { justify-content: stretch; }
+  .actions-row button { flex: 1 1 100%; }
+  .recover-table thead { display: none; }
+  .recover-table tr { display: block; border-bottom: 1px solid var(--line); padding: 8px 0; }
+  .recover-table td { display: block; border: 0; padding: 2px 8px; }
+}
+@media (prefers-reduced-motion: reduce) { .bar > span { transition: none; } }
+@media (forced-colors: active) {
+  button.primary, button.danger { border: 2px solid ButtonText; }
+  .bar > span, .meter > span { background: Highlight; }
+  .note, .tile, .danger-box { border: 1px solid CanvasText; }
+}

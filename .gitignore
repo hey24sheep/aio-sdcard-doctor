@@ -1,0 +1,26 @@
+# build output
+/dist/
+/aio-sdcard-doctor
+/aio-sdcard-doctor.exe
+/aio-sdcard-doctor-gui.exe
+*.test
+*.exe~
+coverage.out
+THIRD_PARTY_NOTICES.txt
+
+# local working state (plan execution ledger, editor files)
+/.superpowers/
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# never commit real card data or rescue output
+*.img
+*.img.map
+*.img.xz
+/Reports/
+!internal/**/testdata/**
+
+# planning docs stay local
+/docs/superpowers/

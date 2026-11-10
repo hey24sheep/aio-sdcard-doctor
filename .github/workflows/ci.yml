@@ -1,0 +1,83 @@
+name: ci
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  ALLOWED_LICENSES: MIT,BSD-2-Clause,BSD-3-Clause,Apache-2.0,ISC,Zlib,0BSD,Unlicense
+  # MIT per its LICENSE file; the go-licenses classifier cannot read it.
+  IGNORED_MODULES: github.com/mattn/go-localereader
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          check-latest: true
+      - run: go vet ./...
+      - run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - run: go test -race ./...
+        env:
+          AIO_REAL_DEVICE_TESTS: "1" # disposable CI machines only: opens a real disk read-only
+      - name: cross-compile all targets
+        shell: bash
+        run: |
+          for os in windows darwin linux; do for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -o /dev/null ./cmd/aio-sdcard-doctor
+          done; done
+      - name: licence gate
+        shell: bash
+        run: |
+          go install github.com/google/go-licenses@v1.6.0
+          for os in windows darwin linux; do
+            GOOS=$os go-licenses check ./... --allowed_licenses="$ALLOWED_LICENSES" --ignore "$IGNORED_MODULES"
+          done
+      - name: disk-full test on a 4 MiB tmpfs
+        if: runner.os == 'Linux'
+        run: |
+          sudo mkdir -p /mnt/tiny && sudo mount -t tmpfs -o size=4m tmpfs /mnt/tiny && sudo chmod 777 /mnt/tiny
+          AIO_TMPFS=/mnt/tiny go test -run TestDiskFullTmpfs ./internal/rescue
+      - name: fuzz smoke
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          for pkg in $(go list ./internal/...); do
+            for f in $(go test -list '^Fuzz' "$pkg" | grep '^Fuzz' || true); do
+              go test -run '^$' -fuzz "^$f\$" -fuzztime 60s "$pkg"
+            done
+          done
+
+  fsimages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build file-system images with the real mkfs tools (dev-only, never shipped)
+        run: |
+          sudo apt-get update && sudo apt-get install -y mtools dosfstools exfatprogs ntfs-3g e2fsprogs xorriso
+          sudo bash scripts/gen-fs-images.sh "$RUNNER_TEMP/fsimages"
+      - run: AIO_FSIMAGES="$RUNNER_TEMP/fsimages" go test -tags realfs ./internal/fsread
+
+  release-snapshot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: goreleaser/goreleaser-action@v6
+        with:
+          version: "~> v2"
+          args: build --snapshot --clean

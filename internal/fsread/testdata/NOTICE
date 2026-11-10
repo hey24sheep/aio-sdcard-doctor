@@ -1,0 +1,3 @@
+ntfs.img.gz is test.ntfs.dd from www.velocidex.com/golang/go-ntfs v0.2.1
+(parser/test_data), Copyright Velocidex Enterprises, Apache License 2.0.
+It is used only by tests and is never shipped in the binary.

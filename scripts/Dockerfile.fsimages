@@ -1,0 +1,7 @@
+# Dev-only container for scripts/gen-fs-images.sh (run with --privileged for loop mounts).
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      mtools dosfstools exfatprogs ntfs-3g e2fsprogs xorriso parted gzip util-linux \
+    && rm -rf /var/lib/apt/lists/*
+COPY gen-fs-images.sh /gen-fs-images.sh
+ENTRYPOINT ["bash", "/gen-fs-images.sh", "/out"]

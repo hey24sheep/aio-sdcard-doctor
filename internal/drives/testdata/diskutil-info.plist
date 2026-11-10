@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>BusProtocol</key>
+	<string>Secure Digital</string>
+	<key>DeviceIdentifier</key>
+	<string>disk4s1</string>
+	<key>FilesystemType</key>
+	<string>msdos</string>
+	<key>Internal</key>
+	<false/>
+	<key>MediaName</key>
+	<string>SD Card Reader</string>
+	<key>MountPoint</key>
+	<string>/Volumes/CARD</string>
+	<key>ParentWholeDisk</key>
+	<string>disk4</string>
+	<key>RemovableMedia</key>
+	<true/>
+	<key>TotalSize</key>
+	<integer>63864569856</integer>
+	<key>VolumeName</key>
+	<string>CARD</string>
+	<key>VolumeUUID</key>
+	<string>6B1D0A2E-1111-3C55-9E0C-AB12CD34EF56</string>
+	<key>WritableMedia</key>
+	<true/>
+</dict>
+</plist>

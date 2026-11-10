@@ -1,0 +1,56 @@
+version: 2
+project_name: aio-sdcard-doctor
+
+before:
+  hooks:
+    - go mod tidy
+    - sh scripts/notices.sh # full licence texts for every target OS
+
+builds:
+  - id: cli
+    main: ./cmd/aio-sdcard-doctor
+    binary: aio-sdcard-doctor
+    env: [CGO_ENABLED=0]
+    goos: [windows, darwin, linux]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -X main.version={{ .Version }}"]
+  - id: gui-windows
+    main: ./cmd/aio-sdcard-doctor
+    binary: aio-sdcard-doctor-gui
+    env: [CGO_ENABLED=0]
+    goos: [windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags: ["-s -w -H windowsgui -X main.version={{ .Version }}"]
+
+archives:
+  - formats: [tar.gz]
+    # Windows archives hold both programs (console + windowed); the others only the console one
+    allow_different_binary_count: true
+    format_overrides:
+      - goos: windows
+        formats: [zip]
+    files: [LICENSE, README.md, THIRD_PARTY_NOTICES.txt]
+
+checksum:
+  name_template: checksums.txt
+
+nfpms:
+  - ids: [cli]
+    package_name: aio-sdcard-doctor
+    homepage: https://github.com/hey24sheep/aio-sdcard-doctor
+    description: Rescue, image, verify, recover and fix SD cards and USB drives.
+    license: MIT
+    maintainer: hey24sheep
+    formats: [deb, rpm]
+    contents:
+      - src: LICENSE
+        dst: /usr/share/doc/aio-sdcard-doctor/LICENSE
+      - src: THIRD_PARTY_NOTICES.txt
+        dst: /usr/share/doc/aio-sdcard-doctor/THIRD_PARTY_NOTICES.txt
+      - src: README.md
+        dst: /usr/share/doc/aio-sdcard-doctor/README.md
+
+release:
+  draft: true
