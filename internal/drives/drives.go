@@ -51,6 +51,11 @@ func (a Identity) LockKey() string {
 	k := "fs:" + NormalizeSerial(a.FSSerial)
 	if NormalizeSerial(a.FSSerial) == "" {
 		k = fmt.Sprintf("disk:%d|%s", a.Size, a.PhysicalID)
+		for _, f := range a.Fingerprint { // a RAW card: its content samples, so same-size cards differ
+			if f.SHA256 != "" {
+				k += "|" + f.Where + "=" + f.SHA256
+			}
+		}
 	}
 	s := sha256.Sum256([]byte(k))
 	return hex.EncodeToString(s[:])
@@ -166,11 +171,20 @@ func Lookup(path string) (Drive, error) {
 			}
 		}
 	}
-	best := -1
-	for i, d := range ds {
-		if under(abs, d.Root) && (best < 0 || len(d.Root) > len(ds[best].Root)) {
-			best = i
+	longest := func(p string) int {
+		best := -1
+		for i, d := range ds {
+			if under(p, d.Root) && (best < 0 || len(d.Root) > len(ds[best].Root)) {
+				best = i
+			}
 		}
+		return best
+	}
+	// the volume that really holds it (a junction or subst letter can point at another one);
+	// the path as given when its real form matches no volume (a network share)
+	best := longest(RealPath(abs))
+	if best < 0 {
+		best = longest(abs)
 	}
 	if best < 0 {
 		return Drive{}, fmt.Errorf("no volume found for %s", path)
@@ -197,12 +211,20 @@ func physicalOfPath(p string) string {
 
 // PhysicalOf returns the physical-disk id of a device or volume path (\\.\PhysicalDriveN,
 // \\.\E:, /dev/sdb1, /dev/disk4s1), or "" for files and folders.
+// evalLink resolves a /dev/disk/by-* link (a seam for tests).
+var evalLink = filepath.EvalSymlinks
+
 func PhysicalOf(p string) string {
 	if strings.HasPrefix(p, `\\.\`) && len(p) == 6 && p[5] == ':' { // \\.\E:
 		if d, err := Lookup(p[4:6] + `\`); err == nil {
 			return d.PhysicalID
 		}
 		return ""
+	}
+	if strings.HasPrefix(p, "/dev/disk/") { // by-id, by-uuid, by-path: links to the real /dev/sdX
+		if r, err := evalLink(p); err == nil {
+			p = r
+		}
 	}
 	id := physicalOfPath(p)
 	if runtime.GOOS == "linux" && id != "" {

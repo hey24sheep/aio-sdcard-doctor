@@ -84,6 +84,9 @@ func IsFAT(fsName string) bool {
 	return false
 }
 
+// Under reports whether p is root or inside it (case-insensitive on Windows and macOS).
+func Under(p, root string) bool { return under(p, root) }
+
 func under(p, root string) bool {
 	if root == "" || p == "" {
 		return false
@@ -159,8 +162,14 @@ func Check(in Input) []job.Issue {
 		srcPhys = in.SrcDevice.PhysicalID
 	}
 	destOK := true
+	// where the destination really is: a junction, subst letter, folder mount point or symlink
+	// can put a harmless-looking path on the card itself
+	onCard := in.Src.Root != "" && (under(in.DstPath, in.Src.Root) || under(drives.RealPath(in.DstPath), drives.RealPath(in.Src.Root)))
+	if s := drives.NormalizeSerial(in.Src.ID.FSSerial); !onCard && s != "" && (in.Src.Removable || in.SrcDevice != nil) {
+		onCard = drives.VolumeSerial(in.DstPath) == s // the destination's own volume is the card's
+	}
 	switch {
-	case under(in.DstPath, in.Src.Root):
+	case onCard:
 		is = append(is, block("dest-inside-source", "The destination is on the card",
 			"Choose a folder on another disk — the card is only ever read."))
 		destOK = false

@@ -48,6 +48,23 @@ func fmtTime(t time.Time) string {
 	return t.Local().Format("2006-01-02 15:04:05")
 }
 
+// Cell makes card-supplied text safe in a spreadsheet: a name starting with = + - or @ would run
+// as a formula when the report is opened in Excel or LibreOffice, so it gets a leading '.
+func Cell(s string) string {
+	if s != "" && strings.ContainsRune("=+-@", rune(s[0])) {
+		return "'" + s
+	}
+	return s
+}
+
+// FromCell undoes Cell when reading a report back.
+func FromCell(s string) string {
+	if len(s) > 1 && s[0] == '\'' && strings.ContainsRune("=+-@", rune(s[1])) {
+		return s[1:]
+	}
+	return s
+}
+
 // WriteCSV writes every entry each yields as a UTF-8 (with BOM) CSV, atomically.
 func WriteCSV(out destfs.FS, path string, each func(func(manifest.Entry) error) error) error {
 	var buf bytes.Buffer
@@ -55,8 +72,8 @@ func WriteCSV(out destfs.FS, path string, each func(func(manifest.Entry) error) 
 	w := csv.NewWriter(&buf)
 	w.Write(Header)
 	err := each(func(e manifest.Entry) error {
-		return w.Write([]string{string(e.Status), string(e.Category), e.Source, e.Dest,
-			strconv.FormatInt(e.Bytes, 10), strconv.FormatInt(e.BadBytes, 10), e.Header, e.SHA256, e.Error, fmtTime(e.MTime)})
+		return w.Write([]string{string(e.Status), string(e.Category), Cell(e.Source), Cell(e.Dest),
+			strconv.FormatInt(e.Bytes, 10), strconv.FormatInt(e.BadBytes, 10), e.Header, e.SHA256, Cell(e.Error), fmtTime(e.MTime)})
 	})
 	if err != nil {
 		return err
@@ -83,6 +100,13 @@ type Summary struct {
 }
 
 // Add counts one entry.
+// Remove takes back an Add (a file retried at the end of the run is counted again then).
+func (s *Summary) Remove(e manifest.Entry) {
+	if s.counts[e.Status] > 0 {
+		s.counts[e.Status]--
+	}
+}
+
 func (s *Summary) Add(e manifest.Entry) {
 	if s.counts == nil {
 		s.counts = map[manifest.Status]int{}
@@ -115,8 +139,10 @@ func (s *Summary) String() string {
 	}
 	b.WriteString("\n")
 	var sts []string
-	for st := range s.counts {
-		sts = append(sts, string(st))
+	for st, n := range s.counts {
+		if n > 0 { // a status emptied by a retry isn't shown
+			sts = append(sts, string(st))
+		}
 	}
 	sort.Strings(sts)
 	for _, st := range sts {

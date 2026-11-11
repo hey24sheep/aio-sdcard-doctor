@@ -38,7 +38,7 @@ Windows, macOS and Linux. Unpack and run: nothing to install.</p>
     </td>
   </tr>
   <tr>
-    <td>Double-click the program (on Windows, <code>aio-sdcard-doctor-gui.exe</code>), or run <code>aio-sdcard-doctor gui</code>. It opens a local page in your browser that only your computer can reach. It follows your light or dark theme.</td>
+    <td>On Windows, double-click <code>aio-sdcard-doctor-gui.exe</code>. Anywhere, run <code>aio-sdcard-doctor gui</code>. It opens a local page in your browser that only your computer can reach. It follows your light or dark theme.</td>
     <td>Run <code>aio-sdcard-doctor tui</code>, or the program with no command in a terminal. Everything works from the keyboard. <code>--ascii</code> swaps the symbols (<code>✔ ▲ ✖ █</code>) for plain ASCII.</td>
   </tr>
 </table>
@@ -133,7 +133,7 @@ Android phones (DCIM, WhatsApp backups, LOST.DIR), DCF cameras, AVCHD and Sony X
 | FAT12/16/32 | yes | yes | yes |
 | exFAT | yes | yes | yes |
 | NTFS | yes | not yet — use Deep scan | not yet |
-| ext2/3/4 | yes | no: ext4 wipes deleted file locations | not yet |
+| ext2/3/4 (checked against real ext4 images) | yes | no: ext4 wipes deleted file locations | not yet |
 | ISO9660 | yes | no: read-only disc format | not yet |
 | APFS, HFS+, encrypted | through the OS mount | no | no |
 
@@ -158,16 +158,16 @@ Not findable by signature: encrypted WhatsApp backups (`.crypt12/14/15`, no reco
 
 ## Install
 
-Download the archive for your system from the release page, check it, and unpack it.
+Download the archive for your system from the [releases page](https://github.com/hey24sheep/aio-sdcard-doctor/releases), check it, and unpack it (each archive unpacks into its own folder).
 
 - **Check the download:** compare its SHA-256 with `checksums.txt` (`certutil -hashfile file.zip SHA256` on Windows, `shasum -a 256 file.tar.gz` on macOS, `sha256sum file.tar.gz` on Linux).
-- **Windows:** the binaries are not code-signed yet, so SmartScreen may warn. After checking the hash: `Unblock-File .\aio-sdcard-doctor.exe` in PowerShell, or *More info → Run anyway*. `aio-sdcard-doctor-gui.exe` opens the window directly (no console).
+- **Windows:** the binaries are not code-signed yet, so SmartScreen may warn. After checking the hash, unblock the downloaded zip before unpacking it (`Unblock-File .\aio-sdcard-doctor_*.zip` in PowerShell, or Properties → Unblock), so both programs inside are trusted; or choose *More info → Run anyway* when it warns. `aio-sdcard-doctor-gui.exe` opens the window directly (no console).
 - **macOS:** remove the download quarantine after checking the hash: `xattr -d com.apple.quarantine ./aio-sdcard-doctor`.
 - **Linux:** `.deb` and `.rpm` packages are also built.
 
 ## Usage
 
-Run it without a command: double-clicked it opens the window, in a terminal it opens the terminal UI, and in a script (or with `--plain`) it lists the drives and these commands. Screen-reader users: the plain commands (`--plain`) give line output with no screen redraws.
+Run it without a command: on Windows, double-clicked it opens the window; in a terminal it opens the terminal UI (on macOS, double-clicking it in Finder opens a terminal, so you get the terminal UI); and in a script (or with `--plain`) it lists the drives and these commands. Screen-reader users: the plain commands (`--plain`) give line output with no screen redraws.
 
 ```
 aio-sdcard-doctor scan    --from E: [--to DIR]
@@ -186,7 +186,7 @@ aio-sdcard-doctor tui     [--ascii] [--no-animation] [--no-bell]
 
 `--from` takes a drive (`E:`), a folder, a device (`\\.\PhysicalDrive2`, `/dev/sdb`, `/dev/disk4`) or a card image file. Run any command with `--help` for every flag. Exit codes: 0 ok, 1 error, 2 usage, 3 finished with partial/failed files, 4 needs admin, 130 interrupted.
 
-**Find deleted files** in two steps if you like: `--list` writes the results list as a CSV (State, Name, Path, Size, Modified, Comment); keep the lines you want and pass the file to `--select`.
+**Find deleted files** in two steps if you like: `--list` writes the results list as a CSV (State, Name, Path, Size, Modified, Comment, ID); keep the lines you want and pass the file to `--select`.
 
 **Images** are ddrescue-compatible: `card.img.map` is a GNU ddrescue mapfile, so `ddrescue` can continue or inspect the image, and `card.img.json` records the card's identity and hashes for `verify --image`. Copy files out of an image with `rescue --from card.img` or `recover --from card.img`, without the card.
 
@@ -197,7 +197,7 @@ aio-sdcard-doctor tui     [--ascii] [--no-animation] [--no-bell]
 ## Honest limits
 
 - A reader process stuck on a dying card may linger until the card answers or is unplugged; the app itself never hangs.
-- Mounting a card lets the OS write small bookkeeping files to it. Slide the card's lock switch before inserting it, or read the card directly (`--raw`).
+- Mounting a card lets the OS write small bookkeeping files to it, and it may update each file's last-access date as it is read. Slide the card's lock switch before inserting it, or read the card directly (`--raw`).
 - Post-write checks read through the OS cache. Run Verify after re-plugging for a full check.
 - Scan and Card tools check/repair/format are not resumable (running them again is the resume). Everything else resumes.
 - A compressed (ZIP) copy resumes by whole ZIP parts: if it stops, the part being written (up to 1,000 files or 1 GiB) is dropped and those files are read from the card again. On a failing card, leave compression off.
@@ -218,7 +218,7 @@ aio-sdcard-doctor tui     [--ascii] [--no-animation] [--no-bell]
 - [x] Rescue with backup choices, bad-sector salvage, resume and verify-after-write
 - [x] Compressed output (ZIP parts / `.img.xz`)
 - [x] Full backup image with ddrescue-compatible mapfile
-- [x] Verify a copy or new card (also reads old PowerShell `copy_*.csv` reports)
+- [x] Verify a copy or new card
 - [x] Built-in read-only parsers: FAT, exFAT, NTFS, ext4, ISO9660, MBR/GPT (checked in tests against images made by the real `mkfs` tools)
 - [x] Isolated reader process (stall/crash recovery, memory cap)
 - [x] Find deleted files: undelete on FAT and exFAT, deep scan for 28 format families with our own carver
@@ -240,6 +240,6 @@ Use this software at your own risk. It is provided "as is", without warranty of 
 
 ## Licence
 
-MIT. Every library compiled into the program uses a permissive licence (MIT, BSD, Apache-2.0, ISC); `scripts/notices.sh` checks this on every CI run and before every release build, and each release ships `THIRD_PARTY_NOTICES.txt`. The OS's own tools (`chkdsk`, `format`, `diskutil`, `fsck`, `mkfs`) are called, never bundled.
+MIT. Every library compiled into the program uses a permissive licence (MIT, BSD, Apache-2.0, ISC, Zlib, 0BSD or Unlicense); `scripts/notices.sh` checks this on every CI run and before every release build, and each release ships `THIRD_PARTY_NOTICES.txt`. The OS's own tools (`chkdsk`, `format`, `diskutil`, `fsck`, `mkfs`) are called, never bundled.
 
 Third-party libraries: go-diskfs, libxfat, go-ntfs (Velocidex), go-ext4-filesystem, go-mp4, mimetype, bbolt, backoff, cobra/pflag, klauspost/compress, ulikunitz/xz, x/image, x/sys, x/term, x/text, Bubble Tea, Lip Gloss and the Charm terminal libraries, termenv, go-runewidth, uniseg, and their dependencies — `THIRD_PARTY_NOTICES.txt` holds every one's full licence text (and the Go standard library's). Linux packages install it in `/usr/share/doc/aio-sdcard-doctor/`.

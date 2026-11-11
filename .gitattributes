@@ -1,0 +1,5 @@
+# LF everywhere, whatever core.autocrlf says: gofmt wants LF, and the shell scripts run in
+# Linux containers (scripts/Dockerfile.fsimages) and on CI, where bash rejects a CR.
+* text=auto eol=lf
+*.png binary
+*.gz binary

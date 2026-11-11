@@ -5,6 +5,7 @@ package validate
 import (
 	"archive/zip"
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	_ "image/gif" // register decoders
@@ -100,36 +101,57 @@ func checkImage(e string, sr *io.SectionReader) (bool, string) {
 	return true, ""
 }
 
-// checkBMFF walks the top-level ISO-BMFF boxes: they must tile the file exactly and include need.
+// checkBMFF walks the top-level ISO-BMFF boxes: they must hold need, and none may run past the
+// end. Data after the last box is a trailer (Insta360 .insv files end with one) and is fine; a
+// "box" whose type isn't printable is where such a trailer starts.
 func checkBMFF(sr *io.SectionReader, size int64, need string) (bool, string) {
-	var end uint64
-	found, boxes := false, 0
+	var last uint64 // end of the last whole box
+	found, boxes, overrun := false, 0, false
+	errTrailer := errors.New("trailer")
 	_, err := mp4.ReadBoxStructure(sr, func(h *mp4.ReadHandle) (interface{}, error) {
 		if boxes++; boxes > maxBoxes {
 			return nil, fmt.Errorf("too many boxes")
 		}
 		bi := h.BoxInfo
+		if !printableType(bi.Type.String()) {
+			return nil, errTrailer
+		}
 		if bi.Type.String() == need {
 			found = true
 		}
+		end := bi.Offset + bi.Size
 		if bi.ExtendToEOF {
 			end = uint64(size)
-		} else {
-			end = bi.Offset + bi.Size
 		}
+		if end > uint64(size) {
+			overrun = true
+			return nil, errTrailer
+		}
+		last = end
 		return nil, nil
 	})
 	switch {
-	case end > uint64(size):
+	case overrun:
 		return false, "truncated (box runs past end of file)"
-	case err != nil:
+	case err != nil && !errors.Is(err, errTrailer) && last == 0:
 		return false, "box structure unreadable"
 	case !found:
 		return false, "missing " + need + " box"
-	case end != uint64(size):
-		return false, "trailing bytes after last box"
 	}
-	return true, ""
+	return true, "" // whatever follows the last whole box is a trailer
+}
+
+// printableType: real box types are four printable characters ("moov", "mdat", "©xyz").
+func printableType(t string) bool {
+	if len(t) != 4 {
+		return false
+	}
+	for _, c := range []byte(t) {
+		if c < 0x20 || c == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 func checkPDF(r io.ReaderAt, size int64) (bool, string) {

@@ -3,7 +3,7 @@ project_name: aio-sdcard-doctor
 
 before:
   hooks:
-    - go mod tidy
+    - go mod tidy -diff # fail on an untidy go.mod rather than fix it silently and ship another tree
     - sh scripts/notices.sh # full licence texts for every target OS
 
 builds:
@@ -32,6 +32,7 @@ archives:
       - goos: windows
         formats: [zip]
     files: [LICENSE, README.md, THIRD_PARTY_NOTICES.txt]
+    wrap_in_directory: true # unpacks into its own folder, not loose into the current one
 
 checksum:
   name_template: checksums.txt
@@ -42,7 +43,9 @@ nfpms:
     homepage: https://github.com/hey24sheep/aio-sdcard-doctor
     description: Rescue, image, verify, recover and fix SD cards and USB drives.
     license: MIT
-    maintainer: hey24sheep
+    maintainer: Hey24sheep <hey24sheep@gmail.com>
+    vendor: Hey24sheep
+    recommends: [dosfstools, exfatprogs, e2fsprogs] # the OS tools Card tools run on Linux
     formats: [deb, rpm]
     contents:
       - src: LICENSE

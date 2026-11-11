@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
@@ -22,20 +23,25 @@ const (
 
 // imgRun is one Run's state.
 type imgRun struct {
-	im        *Image
-	ctx       context.Context
-	env       job.Env
-	dev       Device
-	img       destfs.ImageFile
-	out       destfs.FS
-	m         *Mapfile
-	meta      *Meta
-	size      int64
-	buf       []byte
-	saved     time.Time
-	lastCheck time.Time
-	thr       job.Throttle
+	im         *Image
+	ctx        context.Context
+	env        job.Env
+	dev        Device
+	img        destfs.ImageFile
+	out        destfs.FS
+	m          *Mapfile
+	meta       *Meta
+	size       int64
+	buf        []byte
+	saved      time.Time
+	lastCheck  time.Time
+	failing    int    // failed reads since the last success
+	destSerial string // the image folder's volume serial when the run started ("" if unknown)
+	thr        job.Throttle
 }
+
+// presenceAfterFailures: this many failed reads in a row check the card is there despite the throttle.
+const presenceAfterFailures = 64
 
 func (x *imgRun) ask(is job.Issue) job.Choice {
 	if x.env.Prompt == nil {
@@ -50,18 +56,33 @@ func (x *imgRun) read(pos int64, n int) (int, error) {
 	b := x.buf[:n]
 	got, err := x.dev.ReadAt(b, pos)
 	if err == nil || (got == n) {
+		x.failing = 0
 		return got, nil
 	}
 	// Checking presence lists every disk, so it is throttled: a run of bad sectors on a card
-	// that is still there is just bad sectors (I12).
+	// that is still there is just bad sectors (I12). A long run of failures is checked anyway:
+	// a card pulled just after a bad sector would otherwise turn into "unreadable" zeros.
+	x.failing++
 	now := x.im.Now()
-	if !x.lastCheck.IsZero() && now.Sub(x.lastCheck) < x.im.PresenceEvery {
+	if !x.lastCheck.IsZero() && now.Sub(x.lastCheck) < x.im.PresenceEvery && x.failing < presenceAfterFailures {
 		return got, err
 	}
-	x.lastCheck = now
+	x.lastCheck, x.failing = now, 0
 	path, ok := x.im.Present(x.im.id, x.im.Device)
 	if ok && path == x.im.Device {
-		return got, err // a bad area on a present card
+		// Present at the same path: a bad area, or a handle that went dead (a USB glitch, a
+		// quick reseat at the same drive number). Reopen once, make sure it is still the same
+		// card (one of the same size in the same reader would pass the presence check), retry.
+		if x.dev.Reopen(path) != nil {
+			return got, err
+		}
+		if ok, _ := x.fingerprintMatches(); !ok {
+			return 0, errDifferentCard
+		}
+		if got2, err2 := x.dev.ReadAt(b, pos); err2 == nil || got2 == n {
+			return got2, nil
+		}
+		return got, err
 	}
 	if !ok {
 		c := x.ask(job.Issue{Kind: "card-removed", Severity: job.Warn, Title: "The card was removed — reinsert it",
@@ -82,6 +103,11 @@ func (x *imgRun) read(pos int64, n int) (int, error) {
 	// The device that came back must be the same card before one more sector is written (C1).
 	if ok, _ := x.fingerprintMatches(); !ok {
 		return 0, errDifferentCard
+	}
+	// back under another path: make sure the image's folder didn't move with it (a hub reset can
+	// bring the card and the destination disk back with their letters swapped)
+	if x.destSerial != "" && drives.VolumeSerial(filepath.Dir(x.im.Out)) != x.destSerial {
+		return 0, fmt.Errorf("stopped: when the card came back, the image's folder was no longer on the same disk (drive letters or mount points changed) — check where both are, then run again")
 	}
 	x.im.Device = path
 	return x.dev.ReadAt(x.buf[:n], pos)
@@ -155,6 +181,14 @@ func (x *imgRun) passes() error {
 		{3, NonTrimmed, x.trimPass},
 		{4, NonScraped, x.scrapePass},
 		{5, BadSector, x.retryPass},
+	}
+	// A map can say a later pass while an earlier pass's areas are left (an interrupted GNU
+	// ddrescue run writes its own pass numbers): go back to the first pass with work to do.
+	for _, s := range steps {
+		if s.pass < x.m.Pass && x.m.Bytes(s.status) > 0 {
+			x.m.Pass, x.m.CurPos = s.pass, 0
+			break
+		}
 	}
 	for _, s := range steps {
 		if s.pass < x.m.Pass {

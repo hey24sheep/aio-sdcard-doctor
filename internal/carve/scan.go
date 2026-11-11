@@ -159,7 +159,9 @@ func Scan(ctx context.Context, r io.ReaderAt, size int64, opt Options, from int6
 				if err != nil && !bad || n <= 0 {
 					continue
 				}
-				complete = complete && !bad
+				// a stream that runs into the end of what was searched (the card's end, its size
+				// cap) may go on beyond it: not known to be whole
+				complete = complete && !bad && !(f.Stream && n == limit)
 				h := Hit{Offset: p, Size: n, Format: f.Name, Ext: f.Ext, Cat: f.Cat, Complete: complete, Unreadable: bad}
 				if f.Sub != nil {
 					if e := safeSub(f, r, p, n); e != "" {

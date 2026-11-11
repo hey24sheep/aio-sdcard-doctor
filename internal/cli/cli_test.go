@@ -15,6 +15,7 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/elevate"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/fix"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/fsread"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/manifest"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/profile"
@@ -51,6 +52,7 @@ func TestMain(m *testing.M) {
 		panic(fmt.Sprintf("test reached a real device: %s", t.Disk.Path))
 	}
 	listDevicesFn = func() ([]drives.Device, error) { return nil, nil }
+	probeVolume = func(string) (fsread.Volume, bool) { return fsread.Volume{}, false } // never read a device
 	relaunch = func(context.Context, []string) error { panic("test reached a real elevation (UAC/sudo) request") }
 	doubleClicked = func() bool { return false } // tests run in a terminal, never "double-clicked"
 	runGUI = func(context.Context, IO, bool, int) error { panic("test reached a real GUI") }

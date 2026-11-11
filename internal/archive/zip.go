@@ -95,6 +95,38 @@ func ZipIndexHas(st *job.Store, dest string, size int64) bool {
 	return err == nil && ok && v == size
 }
 
+// ZipPart splits a ZIP destination ("Photos-0001.zip/DCIM/a.jpg") into its part file and the
+// name inside it; ok is false for a folder destination, even a card folder named "pics.zip".
+func ZipPart(dest string) (part, name string, ok bool) {
+	part, name, ok = strings.Cut(dest, "/")
+	return part, name, ok && partRe.MatchString(part)
+}
+
+// ZipParts remembers which names each ZIP part on the destination really holds (read once).
+type ZipParts map[string]map[string]uint64
+
+// Stored reports whether dest is recorded in st's index with this size and its part file in
+// root still holds it: a part deleted or replaced after the run doesn't count as stored.
+func (zp ZipParts) Stored(st *job.Store, root, dest string, size int64) bool {
+	part, name, ok := ZipPart(dest)
+	if !ok || !ZipIndexHas(st, dest, size) {
+		return false
+	}
+	names, seen := zp[part]
+	if !seen {
+		names = map[string]uint64{}
+		if zr, err := zip.OpenReader(filepath.Join(root, part)); err == nil {
+			for _, f := range zr.File {
+				names[f.Name] = f.UncompressedSize64
+			}
+			zr.Close()
+		}
+		zp[part] = names
+	}
+	n, ok := names[name]
+	return ok && n == uint64(size)
+}
+
 func (s *zipSink) Has(dest string, size int64) bool {
 	v, ok, err := job.Get[int64](s.st, indexBucket, dest)
 	return err == nil && ok && v == size

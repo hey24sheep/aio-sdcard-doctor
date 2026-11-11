@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/elevate"
@@ -133,7 +134,7 @@ func (f *Fix) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 			p.Summary = append(p.Summary, "Halfway you'll be asked to unplug and reinsert the card (don't format it when asked)")
 		}
 		p.Result = []string{"Bad areas found and the card's real capacity (fake cards claim more than they hold)",
-			"The card is left without a file system: Format it afterwards",
+			"The card is left without a partition or file system: afterwards, " + FormatElsewhere(f.GOOS),
 			"Stop any time; running the same command again continues where it stopped"}
 	}
 	p.Summary = append(p.Summary, fmt.Sprintf("To confirm you'll type the label %q and the size %q", ConfirmLabel(t), SizeText(t)))
@@ -158,10 +159,25 @@ func inUse(out string) bool {
 	return false
 }
 
+// lockKey is the per-card lock key rescue and imaging use for this card: its file-system serial,
+// or its disk (size and physical id) when it has none.
+func (f *Fix) lockKey() string {
+	if drives.NormalizeSerial(f.Target.Vol.ID.FSSerial) != "" {
+		return f.Target.Vol.ID.LockKey()
+	}
+	return drives.Identity{Size: uint64(f.Target.Disk.Size), PhysicalID: f.Target.Disk.PhysicalID}.LockKey()
+}
+
 // Run performs the operation.
 func (f *Fix) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, error) {
 	f.defaults()
 	res := job.Result{Counters: map[string]int{}, Clean: true}
+	// one run per card (R14): never repair, format or test a card another window is reading
+	unlock, err := job.LockSource(f.lockKey())
+	if err != nil {
+		return res, err
+	}
+	defer unlock()
 	if f.Op == OpHealth {
 		return f.health(ctx, env)
 	}
@@ -184,6 +200,9 @@ func (f *Fix) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, err
 			code = ec.ExitCode()
 		}
 		outcome := interpret(argv[0], f.Op, code)
+		if outcome == "fixed" && f.Op == OpRepair && argv[0] != "chkdsk" {
+			outcome = f.recheck(ctx, buf.String())
+		}
 		if outcome != "ok" && outcome != "fixed" && inUse(buf.String()) && try < 5 {
 			c := env.Prompt.Ask(ctx, job.Issue{Kind: "volume-in-use", Severity: job.Warn, Title: "Close programs using the card",
 				Detail:  "Close Explorer/Finder windows, photo apps and anything else open on the card, then retry.",
@@ -229,9 +248,12 @@ func interpret(tool, op string, code int) string {
 		}
 		return "failed"
 	case strings.HasPrefix(tool, "fsck") || tool == "e2fsck":
+		fat := tool == "fsck.vfat" || tool == "fsck.fat" || tool == "fsck.msdos"
 		switch {
-		case code >= 8:
+		case code >= 8, fat && code == 2: // fsck.fat 2: usage error, the card wasn't touched
 			return "failed"
+		case code&2 != 0 && op != OpCheck: // 2: "reboot" for e2fsck, usage for fsck.fat behind the fsck wrapper
+			return "fixed"
 		case code&4 != 0:
 			if op == OpCheck {
 				return "problems"
@@ -249,6 +271,21 @@ func interpret(tool, op string, code int) string {
 		return "ok"
 	}
 	return "failed"
+}
+
+// recheck runs a check-only pass after an fsck repair said "corrected": fsck.fat exits 1 for a
+// fatal error too (an unreadable boot sector), so only a clean check makes the repair "fixed".
+func (f *Fix) recheck(ctx context.Context, repairOut string) string {
+	argv, err := Command(f.GOOS, OpCheck, f.Target, "")
+	if err != nil {
+		return "fixed"
+	}
+	var buf bytes.Buffer
+	if err := Exec(ctx, argv, io.MultiWriter(f.Out, &buf)); err != nil {
+		fmt.Fprintln(f.Out, "A check after the repair still finds problems ("+err.Error()+"); the repair said:", lastLine(repairOut))
+		return "failed"
+	}
+	return "fixed"
 }
 
 func lastLine(s string) string {
@@ -291,6 +328,10 @@ func (f *Fix) health(ctx context.Context, env job.Env) (job.Result, error) {
 	}
 	rep, err := HealthTest(ctx, rw, t.Size(), env, opt)
 	if err != nil {
+		if t.Disk.Path != "" && strings.Contains(err.Error(), "run the same command again") {
+			// the test wrote over the partition table: the drive letter or /dev/sdb1 is gone
+			err = fmt.Errorf("%w (its drive letter or mount point may be gone by now — continue with --drive %s)", err, t.Disk.Path)
+		}
 		return res, err
 	}
 	var bad int64
@@ -307,22 +348,30 @@ func (f *Fix) health(ctx context.Context, env job.Env) (job.Result, error) {
 	case len(rep.Bad) > 0:
 		env.Log("warn", fmt.Sprintf("%d bad areas (%s). Replace this card.", len(rep.Bad), preflight.GB(bad)))
 	default:
-		env.Log("info", "The whole card held the test pattern: no bad areas, real capacity as claimed. Format it before use.")
+		env.Log("info", "The whole card held the test pattern: no bad areas, real capacity as claimed. Before use, "+FormatElsewhere(f.GOOS)+".")
 	}
 	return res, nil
 }
 
 // findAgain finds the card after a replug: same serial (or model) and size.
 func (f *Fix) findAgain() (Target, error) {
-	ds, err := f.ListDevices()
-	if err != nil {
-		return Target{}, err
-	}
-	for _, d := range ds {
-		if d.Size == f.Target.Disk.Size && (f.Target.Disk.Serial != "" && d.Serial == f.Target.Disk.Serial ||
-			f.Target.Disk.Serial == "" && d.Model == f.Target.Disk.Model && d.PhysicalID == f.Target.Disk.PhysicalID) {
-			return Target{Disk: d}, nil
+	// the OS takes a few seconds to list a card plugged back in: wait for it, within reason
+	for start := time.Now(); ; time.Sleep(time.Second) {
+		ds, err := f.ListDevices()
+		if err != nil {
+			return Target{}, err
+		}
+		for _, d := range ds {
+			if d.Size == f.Target.Disk.Size && (f.Target.Disk.Serial != "" && d.Serial == f.Target.Disk.Serial ||
+				f.Target.Disk.Serial == "" && d.Model == f.Target.Disk.Model && d.PhysicalID == f.Target.Disk.PhysicalID) {
+				return Target{Disk: d}, nil
+			}
+		}
+		if time.Since(start) >= findAgainWait {
+			return Target{}, errors.New("the card isn't back yet — plug it in and run the same command again to continue")
 		}
 	}
-	return Target{}, errors.New("the card isn't back yet — plug it in and run the same command again to continue")
 }
+
+// findAgainWait is how long a re-plugged card may take to show up (a variable for tests).
+var findAgainWait = 30 * time.Second

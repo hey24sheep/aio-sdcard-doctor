@@ -11,7 +11,11 @@ cd "$(dirname "$0")/.."
 tmp=$(mktemp -d)
 trap 'rm -r "$tmp"' EXIT
 # built for this machine once; GOOS below only selects which dependencies are reported
-GOBIN="$tmp" GOOS= GOARCH= go install github.com/google/go-licenses@v1.6.0
+gobin=$tmp
+if command -v cygpath >/dev/null 2>&1; then # Cygwin/MSYS sh: go needs a Windows path in GOBIN
+	gobin=$(cygpath -m "$tmp")
+fi
+GOBIN="$gobin" GOOS= GOARCH= go install github.com/google/go-licenses@v1.6.0
 lic=$(ls "$tmp"/go-licenses*)
 for os in windows darwin linux; do
 	GOOS=$os "$lic" check ./... --allowed_licenses="$allowed" --ignore "$ignored"
@@ -31,8 +35,8 @@ done
 	echo
 	# one block per module (blocks start with "@@@@ <module>"), first copy wins; modules that ship
 	# no licence file are taken from scripts/licenses instead
-	cat "$tmp"/*.txt | awk '
-		/^@@@@ / { name = substr($0, 6); keep = !(name in seen) && name != "github.com/mattn/go-localereader"
+	cat "$tmp"/*.txt | awk -v ignored="$ignored" '
+		/^@@@@ / { name = substr($0, 6); keep = !(name in seen) && name != ignored
 		           seen[name] = 1; if (keep) order[++n] = name; next }
 		keep { body[name] = body[name] $0 "\n" }
 		END { for (i = 1; i <= n; i++) printf "%s", body[order[i]] }'

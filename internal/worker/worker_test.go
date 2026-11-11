@@ -317,3 +317,26 @@ func TestRespawnWaitsForReaper(t *testing.T) {
 		t.Fatal("no new worker")
 	}
 }
+
+// Adversarial pass S6: through the reader process a symbolic link looked like a regular file and
+// was followed (a link out of the card copied a host file into the rescue). It arrives as a link.
+func TestWorkerListsLinksAsLinks(t *testing.T) {
+	d := folder(t)
+	if err := os.Symlink(filepath.Join(os.TempDir()), filepath.Join(d, "outside")); err != nil {
+		t.Skipf("no symlink rights here: %v", err)
+	}
+	c := spawn(t, Spec{From: d}, 5*time.Second)
+	es, err := c.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range es {
+		if e.Name() == "outside" {
+			if e.Type()&fs.ModeSymlink == 0 {
+				t.Fatalf("link listed as %v", e.Type())
+			}
+			return
+		}
+	}
+	t.Fatal("link not listed")
+}

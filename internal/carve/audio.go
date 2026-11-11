@@ -42,10 +42,10 @@ func mp3FrameLen(b []byte) int64 {
 }
 
 // MP3: ID3v2 size + frame walk (+ ID3v1 tag).
-var mp3Format = Format{Name: "mp3", Ext: "mp3", Cat: profile.Music, MaxSize: 1 * gib,
+var mp3Format = Format{Stream: true, Name: "mp3", Ext: "mp3", Cat: profile.Music, MaxSize: 1 * gib,
 	Magics: []Magic{m(0, "ID3"), {0, []byte{0xFF, 0xFB}}, {0, []byte{0xFF, 0xFA}}, {0, []byte{0xFF, 0xF3}},
 		{0, []byte{0xFF, 0xF2}}, {0, []byte{0xFF, 0xE3}}, {0, []byte{0xFF, 0xE2}}},
-	Size: sizer(func(x *rd) (int64, error) {
+	Size: streamSizer(func(x *rd) (int64, error) {
 		pos, need := int64(0), 8
 		h, err := x.bytes(0, 10)
 		if err != nil {
@@ -93,8 +93,8 @@ var mp3Format = Format{Name: "mp3", Ext: "mp3", Cat: profile.Music, MaxSize: 1 *
 	})}
 
 // AAC (ADTS): frame lengths.
-var aacFormat = Format{Name: "aac", Ext: "aac", Cat: profile.Music, MaxSize: 1 * gib,
-	Magics: []Magic{{0, []byte{0xFF, 0xF1}}, {0, []byte{0xFF, 0xF9}}}, Size: sizer(func(x *rd) (int64, error) {
+var aacFormat = Format{Stream: true, Name: "aac", Ext: "aac", Cat: profile.Music, MaxSize: 1 * gib,
+	Magics: []Magic{{0, []byte{0xFF, 0xF1}}, {0, []byte{0xFF, 0xF9}}}, Size: streamSizer(func(x *rd) (int64, error) {
 		pos, frames := int64(0), 0
 		for {
 			if err := x.step(); err != nil {
@@ -123,8 +123,8 @@ var amrSizes = [2][16]int64{
 }
 
 // AMR / AMR-WB: frame headers; ends at the first invalid header or an all-zero frame.
-var amrFormat = Format{Name: "amr", Ext: "amr", Cat: profile.Music, MaxSize: 256 * mib,
-	Magics: []Magic{m(0, "#!AMR\n"), m(0, "#!AMR-WB\n")}, Size: sizer(func(x *rd) (int64, error) {
+var amrFormat = Format{Stream: true, Name: "amr", Ext: "amr", Cat: profile.Music, MaxSize: 256 * mib,
+	Magics: []Magic{m(0, "#!AMR\n"), m(0, "#!AMR-WB\n")}, Size: streamSizer(func(x *rd) (int64, error) {
 		h, err := x.bytes(0, 9)
 		if err != nil {
 			return 0, err

@@ -12,7 +12,7 @@ permissions:
 
 # a newer push to the same branch cancels the run still going
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -65,31 +65,7 @@ jobs:
             done
           done
 
-  # rebuilds internal/fsread/testdata/realfs with the real mkfs tools and checks them; run by hand
-  # (Actions → ci → Run workflow) after changing scripts/gen-fs-images.sh, then commit the artifact
-  fsimages:
-    if: github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-      - name: build file-system images with the real mkfs tools (dev-only, never shipped)
-        run: |
-          sudo apt-get update -q && sudo apt-get install -y -q --no-install-recommends mtools dosfstools exfatprogs ntfs-3g e2fsprogs xorriso parted
-          sudo bash scripts/gen-fs-images.sh "$RUNNER_TEMP/fsimages"
-      - run: AIO_FSIMAGES="$RUNNER_TEMP/fsimages" go test -count=1 -run TestRealFSImages ./internal/fsread
-      - name: keep the images (copy into internal/fsread/testdata/realfs)
-        if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: fsimages
-          path: ${{ runner.temp }}/fsimages/*.img.gz
-          retention-days: 3
-
-  # checks .goreleaser.yaml still builds; only on main, where releases come from
+  # the whole release (archives, packages, checksums; nothing published); only on main
   release-snapshot:
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
@@ -102,4 +78,4 @@ jobs:
       - uses: goreleaser/goreleaser-action@v6
         with:
           version: "~> v2"
-          args: build --snapshot --clean
+          args: release --snapshot --clean # the whole release: archives, packages, checksums (nothing published)

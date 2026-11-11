@@ -6,6 +6,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -43,6 +44,7 @@ type Model struct {
 	size     string
 	field    int // 0 none, 1 label, 2 size (card tools confirmation)
 	stopAsk  bool
+	issueID  string // the question issueSel belongs to
 	issueSel int
 	help     bool
 	bellFor  string
@@ -108,7 +110,12 @@ func (m *Model) refresh() {
 		}
 	}
 	if m.v.Issue == nil {
-		m.issueSel = 0
+		m.issueSel, m.issueID = 0, ""
+	} else {
+		m.stopAsk = false              // the engine's question comes first, and must be on screen to be answered
+		if m.v.Issue.ID != m.issueID { // a new question starts on its default, as the GUI does
+			m.issueID, m.issueSel = m.v.Issue.ID, max(0, slices.Index(m.v.Issue.Issue.Choices, m.v.Issue.Issue.Default))
+		}
 	}
 }
 
@@ -561,13 +568,15 @@ func (m *Model) View() string {
 		crumbs = append(crumbs, label)
 	}
 	body := m.body(p)
+	// the problem and busy lines stay on screen however long the page: kept out of the window
+	var tail []string
 	if m.flash != "" {
-		body = append(body, "", p.fail.Render(m.sym("✖ ", "x ")+"Problem: ")+m.flash)
+		tail = append(tail, "", p.fail.Render(m.sym("✖ ", "x ")+"Problem: ")+m.flash)
 	} else if m.v.Error != "" && m.v.Step != app.StepResults {
-		body = append(body, "", p.fail.Render(m.sym("✖ ", "x ")+"Problem: ")+m.v.Error)
+		tail = append(tail, "", p.fail.Render(m.sym("✖ ", "x ")+"Problem: ")+m.v.Error)
 	}
 	if m.v.Busy != "" {
-		body = append(body, "", p.steel.Render(m.v.Busy+"…"))
+		tail = append(tail, "", p.steel.Render(m.v.Busy+"…"))
 	}
 	foot := p.steel.Render(m.helpBar())
 	if m.help {
@@ -575,7 +584,7 @@ func (m *Model) View() string {
 	}
 	// fit: header, steps, blank, body (windowed around the cursor), blank, help
 	room := m.h - 5
-	body = window(body, room, m.cursorLine)
+	body = append(window(body, max(room-len(tail), 1), m.cursorLine), tail...)
 	trail := strings.Join(crumbs, p.steel.Render(m.sym(" › ", " > ")))
 	if lipgloss.Width(trail) > m.w { // too long for this width: say where we are in words
 		at := 0
@@ -645,11 +654,14 @@ func (m *Model) helpBar() string {
 		return "↑/↓ move · Enter choose · s system · p folder/image · r refresh · q quit · ? help"
 	case app.StepReview:
 		h := "Enter start · e change folder · Esc back · q quit"
+		if m.v.Req.Action == "fix" { // card tools have no folder
+			h = "Enter start · Esc back · q quit"
+		}
 		if m.v.Confirm != nil {
 			h = "Tab type label and size · " + h
 		}
-		if m.hasWarnings() {
-			h += " · a accept warnings"
+		if m.hasWarnings() { // first: the end of a long help line is what a narrow terminal cuts
+			h = "a accept warnings · " + h
 		}
 		return h
 	case app.StepRun:
@@ -892,7 +904,11 @@ func (m *Model) body(p palette) []string {
 		if rv == nil {
 			break
 		}
-		b = append(b, p.steel.Render(fmt.Sprintf("%s found · %s shown · %s ticked · unrecoverable files can't be ticked", commas(rv.Total), commas(rv.Shown), commas(rv.Ticked))))
+		shown := commas(rv.Shown) + " match"
+		if rv.Listed < rv.Shown { // only a page is listed: say so, and how to reach the rest
+			shown += fmt.Sprintf(" (first %s listed — / to filter, a ticks all %s)", commas(rv.Listed), commas(rv.Shown))
+		}
+		b = append(b, p.steel.Render(fmt.Sprintf("%s found · %s · %s ticked · unrecoverable files can't be ticked", commas(rv.Total), shown, commas(rv.Ticked))))
 		if m.typing {
 			b = append(b, "Filter: "+m.text+m.sym("▏", "_"))
 		}
@@ -1021,7 +1037,7 @@ func (m *Model) frame(lines []string) string {
 }
 
 var choiceLabels = map[job.Choice]string{job.Continue: "Continue", job.Stop: "Stop", job.Retry: "Try again", job.Wait: "Wait for the card",
-	"skip-rest": "Skip the rest (report them failed)", job.Resume: "Continue where it stopped", job.New: "Start over",
+	"skip-rest": "Skip the rest (report them failed)", job.Skip: "Skip this file", job.Resume: "Continue where it stopped", job.New: "Start over",
 	job.Elevate: "Restart as administrator", "skip-videos": "Skip videos", job.Image: "Make an image instead"}
 
 func choiceLabel(c job.Choice) string {

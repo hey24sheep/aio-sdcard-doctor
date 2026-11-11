@@ -21,10 +21,14 @@ function h(tag, attrs = {}, ...kids) {
   }
   for (const kid of kids.flat(Infinity)) {
     if (kid == null || kid === false) continue;
-    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+    el.append(kid instanceof Node ? kid : document.createTextNode(String(kid).replace(reorder, " ")));
   }
   return el;
 }
+
+// Invisible marks that reorder text (bidi overrides and isolates, LRM/RLM, zero-width space): a
+// crafted card name could show "photo.exe" as "photo.jpg". Same set the terminal UI removes.
+const reorder = /[​‎‏‪-‮⁦-⁩؜﻿]/g;
 
 function gb(n) {
   if (n >= 1 << 30) return (n / (1 << 30)).toFixed(1) + " GB";
@@ -33,8 +37,18 @@ function gb(n) {
 }
 const commas = (n) => Number(n || 0).toLocaleString("en");
 
+let gone = false;
+const stopOnGone = []; // the event stream and timers: a closed program isn't asked again every 2 s
+
 async function api(path, opts = {}) {
-  const r = await fetch(path, { credentials: "same-origin", ...opts });
+  if (gone) throw new Error("gone");
+  let r;
+  try {
+    r = await fetch(path, { credentials: "same-origin", ...opts });
+  } catch (e) { // the program was closed: say so instead of a page that silently stops working
+    showGone(true);
+    throw e;
+  }
   if (r.status === 403) { showGone(); throw new Error("forbidden"); }
   return r;
 }
@@ -62,10 +76,15 @@ function flash(msg) {
   main.prepend(h("div", { class: "note error flash", role: "alert" }, h("span", { class: "kind" }, "Not done: "), msg));
 }
 
-function showGone() {
+function showGone(closed) {
+  if (gone) return;
+  gone = true;
+  stopOnGone.forEach((stop) => stop());
   document.body.replaceChildren(h("main", { id: "main", class: "layout" },
-    h("div", {}, h("h1", {}, "This window is no longer connected"),
-      h("p", {}, "Run aio-sdcard-doctor gui again: it reopens the running copy, and anything that was working carries on."))));
+    h("div", {}, h("h1", {}, closed ? "SD card doctor was closed" : "This window is no longer connected"),
+      h("p", {}, closed
+        ? "Run aio-sdcard-doctor gui to start it again. A rescue or image that was interrupted picks up where it stopped when you run it again."
+        : "Run aio-sdcard-doctor gui again: it reopens the running copy, and anything that was working carries on."))));
 }
 
 async function refresh() {
@@ -385,7 +404,9 @@ function stepRecoverList() {
   const states = { Excellent: "Excellent", Poor: "Poor", Unrecoverable: "Unrecoverable" };
   return [
     h("h1", {}, "Pick the files to bring back"),
-    h("p", { class: "muted" }, `${commas(rv.total)} found · ${commas(rv.shown)} shown · ${commas(rv.ticked)} ticked. Unrecoverable files are listed with the reason and can't be ticked.`),
+    h("p", { class: "muted" }, `${commas(rv.total)} found · ${commas(rv.shown)} match` +
+      (rv.listed < rv.shown ? ` (the first ${commas(rv.listed)} are listed: filter to narrow, or tick all ${commas(rv.shown)})` : "") +
+      ` · ${commas(rv.ticked)} ticked. Unrecoverable files are listed with the reason and can't be ticked.`),
     h("label", { for: "filter" }, "Filter by name or folder"),
     h("input", { type: "text", id: "filter", value: filter, oninput: (e) => (filter = e.target.value),
       onchange: () => doCmd("recover-filter", { text: filter }) }),
@@ -455,6 +476,9 @@ function render() {
     for (const k of Object.keys(drafts)) if (k !== "path") delete drafts[k];
     drafts.action = view.req.action;
   }
+  if (stepChanged) { // a confirmation is for the check it was typed on, never the next one
+    delete drafts.accept; delete drafts.clabel; delete drafts.csize;
+  }
   main.dataset.step = view.step;
   main.replaceChildren(...[view.step !== "review" && view.step !== "results" ? errorNote() : null, ...(fn ? fn() : [])].flat(Infinity).filter(Boolean));
   const [ht, hp] = help[view.step] || ["", ""];
@@ -484,10 +508,12 @@ function renderIssue() {
       onclick: () => { dlg.close(); doCmd("answer", { id: iv.id, choice: c }); } }, choiceLabel(c)))));
   dlg.oncancel = (e) => { e.preventDefault(); dlg.close(); doCmd("answer", { id: iv.id, choice: safe }); }; // Esc = the safe choice
   dlg.showModal();
+  const def = [...dlg.querySelectorAll("button")].find((b) => b.classList.contains("primary"));
+  if (def) def.focus(); // Enter answers with the default (the highlighted one), not the first button
   $("live").textContent = is.Title;
 }
 
-const labels = { continue: "Continue", stop: "Stop", retry: "Try again", wait: "Wait for the card", "skip-rest": "Skip the rest (report them failed)",
+const labels = { continue: "Continue", stop: "Stop", retry: "Try again", wait: "Wait for the card", "skip-rest": "Skip the rest (report them failed)", skip: "Skip this file",
   resume: "Continue where it stopped", new: "Start over", elevate: "Restart as administrator", "skip-videos": "Skip videos", "image-instead": "Make an image instead" };
 const choiceLabel = (c) => labels[c] || c;
 
@@ -520,7 +546,8 @@ function connect() {
   // question or a finish that was missed is shown
   es.addEventListener("hello", () => refresh());
   es.onerror = () => { /* the browser reconnects by itself */ };
-  setInterval(() => { if (view && (view.step === "run" || view.issue)) refresh(); }, 5000); // safety net
+  const t = setInterval(() => { if (view && (view.step === "run" || view.issue)) refresh(); }, 5000); // safety net
+  stopOnGone.push(() => es.close(), () => clearInterval(t));
 }
 
 function themeToggle() {
@@ -544,6 +571,7 @@ async function main() {
   csrf = (await r.json()).CSRF;
   await refresh();
   connect();
-  setInterval(() => { if (view && view.step === "drive") doCmd("refresh"); }, 2000); // a card inserted shows up by itself
+  const t = setInterval(() => { if (view && view.step === "drive") doCmd("refresh"); }, 2000); // a card inserted shows up by itself
+  stopOnGone.push(() => clearInterval(t));
 }
 main();

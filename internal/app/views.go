@@ -163,7 +163,8 @@ type RecoverRow struct {
 type RecoverView struct {
 	Rows   []RecoverRow `json:"rows"`
 	Total  int          `json:"total"`
-	Shown  int          `json:"shown"`
+	Shown  int          `json:"shown"`  // rows matching the filter
+	Listed int          `json:"listed"` // rows in Rows: at most pageRows of them
 	Ticked int          `json:"ticked"`
 	Filter string       `json:"filter"`
 }
@@ -243,6 +244,7 @@ func (r *recoverState) view() *RecoverView {
 		v.Rows = append(v.Rows, RecoverRow{ID: x.ID, Name: x.Name, Path: x.Path, Size: x.Size, Modified: mod, State: x.State,
 			Comment: x.Comment, Ticked: r.ticked[x.ID], Tickable: x.State != recovery.Unrecoverable})
 	}
+	v.Listed = len(v.Rows)
 	return v
 }
 
@@ -275,6 +277,14 @@ type View struct {
 }
 
 // View is a snapshot of the session.
+// Step is the current step alone: the GUI's once-a-second idle check needs only this, and View
+// rebuilds the whole recover list.
+func (s *Session) Step() Step {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.step
+}
+
 func (s *Session) View() View {
 	s.mu.Lock()
 	defer s.mu.Unlock()

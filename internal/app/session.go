@@ -114,6 +114,7 @@ type Session struct {
 	showSystem bool
 	card       *drives.Drive
 	req        Request
+	planReq    Request // the request the current plan was checked with: what Start runs
 	choices    []ChoiceRow
 	busy       string
 	err        string
@@ -277,7 +278,7 @@ func (s *Session) Do(c Command) error {
 	}
 	s.mu.Lock()
 	err := s.do(c)
-	if err != nil {
+	if err != nil && !(s.step == StepRun && c.Name == "start") { // a second click on Start: nothing to show all run long
 		s.err = err.Error()
 	}
 	s.emitLocked(Event{Kind: "state"})
@@ -468,8 +469,7 @@ func (s *Session) chooseActionOpt(name string, withChoices bool) error {
 				}
 			}
 			s.goStep(flow[name][0])
-			if flow[name][0] == StepReview {
-				s.history = s.history[:len(s.history)-1]
+			if flow[name][0] == StepReview { // straight to the check (scan): Back returns to "What to do"
 				s.startPlan()
 			}
 			if s.step == StepChoice && withChoices {
@@ -556,6 +556,11 @@ func sameOrInside(p, root string) bool {
 
 func (s *Session) setOption(name, value string) error {
 	on := value == "1" || value == "true" || value == "on"
+	// once checked, what runs is what was checked: options change only before (Back to change
+	// them); "fresh" is the one choice on the check page, and it checks again
+	if (s.step == StepReview || s.step == StepElevate || s.step == StepRun) && name != "fresh" {
+		return errors.New("go back to change this: the check shows what will run")
+	}
 	switch name {
 	case "compress":
 		s.req.Compress = on
@@ -653,7 +658,7 @@ func (s *Session) plan2() {
 				c.Close()
 			}
 		} else {
-			s.action, s.plan = a, &p
+			s.action, s.plan, s.planReq = a, &p, req
 			if p.NeedsAdmin && !s.deps.IsAdmin() {
 				s.instr = s.deps.Instruction(nil)
 				s.goStep(StepElevate)
@@ -701,7 +706,7 @@ func (s *Session) start(c Command) error {
 	if warns > 0 && arg(c, "accept") != "1" {
 		return errors.New("read the warnings and accept them to start")
 	}
-	if cf, ok := s.action.(confirmer); ok && needsTyped(s.req) {
+	if cf, ok := s.action.(confirmer); ok && needsTyped(s.planReq) {
 		if err := cf.Confirm(c.Args["label"], c.Args["size"]); err != nil {
 			label, size := cf.ConfirmText()
 			return fmt.Errorf("type the label %q and the size %q exactly as shown (%v)", label, size, err)
@@ -711,7 +716,7 @@ func (s *Session) start(c Command) error {
 	s.runCancel = cancel
 	s.goStep(StepRun)
 	s.progress, s.result, s.logs = nil, nil, nil
-	a, plan, req := s.action, *s.plan, s.req
+	a, plan, req := s.action, *s.plan, s.planReq
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -798,6 +803,8 @@ func (p prompter) Ask(ctx context.Context, is job.Issue) job.Choice {
 
 func (s *Session) nextAction(name string) error {
 	prev := s.req
+	// a new flow from the same card: Back leads to "What to do", never to an old run's results
+	s.history, s.step = []Step{StepDrive}, StepAction
 	if err := s.chooseAction(name); err != nil {
 		return err
 	}

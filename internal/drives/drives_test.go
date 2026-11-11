@@ -299,3 +299,14 @@ func TestParseSysfsGateFacts(t *testing.T) {
 		t.Errorf("superfloppy: %+v", v)
 	}
 }
+
+// Adversarial pass S11: a source named /dev/disk/by-id/… (how many Linux users name a USB card)
+// wasn't resolved, so the same-disk protections had no disk to compare.
+func TestPhysicalOfResolvesByIDLinks(t *testing.T) {
+	old := evalLink
+	defer func() { evalLink = old }()
+	evalLink = func(string) (string, error) { return "/dev/sdb1", nil }
+	if got, want := PhysicalOf("/dev/disk/by-id/usb-Generic_SD_Reader-0:0-part1"), PhysicalOf("/dev/sdb1"); got != want || got == "" {
+		t.Fatalf("by-id link → %q, want %q", got, want)
+	}
+}

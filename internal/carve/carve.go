@@ -34,6 +34,9 @@ type Format struct {
 	// HeaderSized: the end comes from sizes in the header, not from walking the data, so a stale
 	// header could claim space that now holds other files; Scan keeps looking inside it.
 	HeaderSized bool
+	// Stream: frames or packets one after another with no total length (streamSizer); one that
+	// runs exactly to the end of its data is whole when that end is the file's (Verify).
+	Stream bool
 }
 
 // Hit is one file found by Scan.
@@ -102,6 +105,7 @@ type rd struct {
 	win    []byte // read-ahead window: a walk's many small reads become few large ones
 	winOff int64
 	winLen int64 // next window size: starts small (most candidates fail early), doubles to 1 MiB
+	atEnd  bool  // the last truncated read started exactly at the end of the data
 }
 
 func (x *rd) bytes(off int64, n int) ([]byte, error) {
@@ -109,6 +113,7 @@ func (x *rd) bytes(off int64, n int) ([]byte, error) {
 		return nil, errBad
 	}
 	if off+int64(n) > x.limit {
+		x.atEnd = off == x.limit
 		if off < x.limit {
 			x.seen = max(x.seen, x.limit)
 		}
@@ -141,7 +146,7 @@ func (x *rd) bytes(off int64, n int) ([]byte, error) {
 
 func (x *rd) step() error {
 	x.steps++
-	if x.steps > maxSteps {
+	if x.steps > maxSteps && int64(x.steps) > x.limit>>8 { // long files may take more steps
 		return errSteps
 	}
 	return nil
@@ -185,10 +190,22 @@ func (x *rd) find(from, stop int64, pats ...[]byte) (int64, []byte, error) {
 
 // sizer adapts a structure walk to Format.Size: errTrunc → incomplete with what was seen.
 func sizer(walk func(x *rd) (int64, error)) func(io.ReaderAt, int64, int64) (int64, bool, error) {
+	return sizerEnd(walk, false)
+}
+
+// streamSizer is sizer for streams (frames or packets one after another, no total length): one
+// that runs exactly to the end of the data is complete, not truncated.
+func streamSizer(walk func(x *rd) (int64, error)) func(io.ReaderAt, int64, int64) (int64, bool, error) {
+	return sizerEnd(walk, true)
+}
+
+func sizerEnd(walk func(x *rd) (int64, error), stream bool) func(io.ReaderAt, int64, int64) (int64, bool, error) {
 	return func(r io.ReaderAt, off, limit int64) (int64, bool, error) {
 		x := &rd{r: r, base: off, limit: limit}
 		n, err := walk(x)
 		switch {
+		case stream && errors.Is(err, errTrunc) && x.atEnd && limit > 0:
+			return limit, true, nil
 		case err == nil:
 			if n <= 0 || n > limit {
 				return 0, false, errBad

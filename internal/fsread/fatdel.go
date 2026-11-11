@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"path"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -70,7 +71,13 @@ func readFATLayout(r io.ReaderAt, kind string) (*fatLayout, error) {
 	}
 	raw := make([]byte, fatSecs*bps)
 	if _, err := r.ReadAt(raw, fatOff); err != nil && !errors.Is(err, io.EOF) {
-		return nil, err
+		// a bad sector in the first FAT: the copy right after it (cards keep two) holds the same
+		if nfats < 2 {
+			return nil, err
+		}
+		if _, err2 := r.ReadAt(raw, fatOff+fatSecs*bps); err2 != nil && !errors.Is(err2, io.EOF) {
+			return nil, err
+		}
 	}
 	// some formatters size the FAT a little short of the data area: clusters it can't number
 	// can't hold files either
@@ -218,6 +225,12 @@ func (l *fatLayout) entries(raw []byte) []fatEntry {
 					}
 				}
 				name = string(utf16.Decode(u))
+				// a deleted name whose tail slot was reused keeps only its first part: if it doesn't
+				// end with the short name's extension, it isn't the whole name — use the short one
+				if sx := strings.TrimRight(string(e[8:11]), " "); del && sx != "" &&
+					!strings.HasPrefix(strings.ToUpper(strings.TrimPrefix(path.Ext(name), ".")), strings.ToUpper(sx)) { // .heic → HEI
+					name = ""
+				}
 			}
 		}
 		if name == "" {
@@ -273,10 +286,16 @@ func (l *fatLayout) readDir(clus uint32, deleted bool) []byte {
 	}
 	var b []byte
 	for _, c := range l.chain(clus) {
+		if int64(len(b)) >= maxDirBytes { // FAT allows 65,536 entries: a longer chain is damage
+			break
+		}
 		b = append(b, l.read(l.off(c), l.cluster)...)
 	}
 	return b
 }
+
+// maxDirBytes is the largest a FAT directory can be (65,536 entries of 32 bytes).
+const maxDirBytes = 65536 * 32
 
 // walk visits every entry depth first; inGone is true below a deleted directory.
 func (l *fatLayout) walk(ctx context.Context, clus uint32, dir string, gone bool, depth int,
@@ -365,4 +384,57 @@ func (l *fatLayout) live(ctx context.Context, emit func(path string, off, n int6
 		}
 		return nil
 	})
+}
+
+// dirRecords reads the records of the live directory at path ("" or "." = the root).
+func (l *fatLayout) dirRecords(dir string) ([]byte, bool) {
+	raw := l.readDir(0, false)
+	for _, seg := range strings.Split(dir, "/") {
+		if seg == "" || seg == "." {
+			continue
+		}
+		found := false
+		for _, e := range l.entries(raw) {
+			if !e.deleted && e.dir && e.name == seg && l.valid(e.clus) {
+				raw, found = l.readDir(e.clus, false), true
+				break
+			}
+		}
+		if !found {
+			return nil, false
+		}
+	}
+	return raw, true
+}
+
+// lookup finds the live entry at path.
+func (l *fatLayout) lookup(p string) (fatEntry, bool) {
+	dir, name := path.Split(p)
+	raw, ok := l.dirRecords(strings.TrimSuffix(dir, "/"))
+	if !ok {
+		return fatEntry{}, false
+	}
+	for _, e := range l.entries(raw) {
+		if !e.deleted && e.name == name {
+			return e, true
+		}
+	}
+	return fatEntry{}, false
+}
+
+// extents are a live file's cluster runs, [offset in the volume, length], cut to its size.
+func (l *fatLayout) extents(e fatEntry) [][2]int64 {
+	var out [][2]int64
+	cs, left := l.chain(e.clus), e.size
+	for i := 0; i < len(cs) && left > 0; {
+		j := i + 1
+		for j < len(cs) && cs[j] == cs[j-1]+1 {
+			j++
+		}
+		n := min(int64(j-i)*l.cluster, left)
+		out = append(out, [2]int64{l.off(cs[i]), n})
+		left -= n
+		i = j
+	}
+	return out
 }

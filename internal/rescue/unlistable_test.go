@@ -37,3 +37,27 @@ func TestUnlistableFolderReported(t *testing.T) {
 		t.Fatal("manifest.json doesn't list the unreadable folder")
 	}
 }
+
+// Adversarial pass (minor): a folder that couldn't be listed once kept its FAILED row after a
+// later run listed and copied it, so Card tools kept saying the rescue was incomplete.
+func TestFolderListedLaterDropsItsFailedRow(t *testing.T) {
+	src := testutil.WriteFolder(t, testutil.Card{"DCIM/100GOOD/a.jpg": {Data: testutil.JPEG(2000, "a")}, "DCIM/100BROKE/b.jpg": {Data: testutil.JPEG(2000, "b")}})
+	dst := filepath.Join(t.TempDir(), "out")
+	f := newFake(t, src)
+	f.listErr = map[string]error{"DCIM/100BROKE": errors.New("I/O error")}
+	r := newRescue(src, dst, f)
+	r.Types = nil
+	do(t, r, nil, destfs.New(dst, src))
+	r = newRescue(src, dst, newFake(t, src)) // the folder reads fine this time
+	r.Types = nil
+	res, err := do(t, r, nil, destfs.New(dst, src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := entries(t, dst)["DCIM/100BROKE/"]; ok {
+		t.Fatalf("stale folder row kept: %+v", e)
+	}
+	if e := entries(t, dst)["DCIM/100BROKE/b.jpg"]; e.Status != manifest.OK || !res.Clean {
+		t.Fatalf("file %+v clean %v", e, res.Clean)
+	}
+}

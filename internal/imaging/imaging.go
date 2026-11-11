@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"time"
@@ -16,7 +17,6 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/elevate"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
-	"github.com/hey24sheep/aio-sdcard-doctor/internal/manifest"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/preflight"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/retry"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/source"
@@ -152,7 +152,7 @@ func (im *Image) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	if free, err := destfs.Free(dir); err == nil && dst.Free == 0 {
 		in.Dst.Free = free
 	}
-	_, mapErr := os.Stat(im.mapPath())
+	_, mapErr := readOrBak(im.mapPath()) // the map, or its .bak after a power cut mid-save
 	_, outErr := os.Stat(im.Out)
 	switch {
 	case mapErr == nil && outErr == nil:
@@ -206,12 +206,23 @@ func (im *Image) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 }
 
 func loadMap(p string) (*Mapfile, error) {
-	f, err := os.Open(p)
+	b, err := readOrBak(p)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	return ParseMapfile(f)
+	return ParseMapfile(bytes.NewReader(b))
+}
+
+// readOrBak reads p, or the p.bak a save leaves for a moment (renamed aside before the new file
+// goes in): a power cut right then must not make the image impossible to resume.
+func readOrBak(p string) ([]byte, error) {
+	b, err := os.ReadFile(p)
+	if errors.Is(err, fs.ErrNotExist) {
+		if bb, berr := os.ReadFile(p + ".bak"); berr == nil {
+			return bb, nil
+		}
+	}
+	return b, err
 }
 
 func (im *Image) save(out destfs.FS, m *Mapfile, meta *Meta) error {
@@ -267,12 +278,13 @@ func (im *Image) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		defer release()
 	}
 	x := &imgRun{im: im, ctx: ctx, env: env, dev: im.dev, out: out, size: im.size, buf: make([]byte, chunk),
-		thr: job.Throttle{Every: 100 * time.Millisecond}}
+		destSerial: drives.VolumeSerial(filepath.Dir(im.Out)),
+		thr:        job.Throttle{Every: 100 * time.Millisecond}}
 	resume := false
 	if m, err := loadMap(im.mapPath()); err == nil {
 		x.m, resume = m, true
 		x.meta = &Meta{}
-		if b, err := os.ReadFile(im.metaPath()); err == nil {
+		if b, err := readOrBak(im.metaPath()); err == nil {
 			json.Unmarshal(b, x.meta)
 		}
 	} else {
@@ -305,13 +317,13 @@ func (im *Image) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	if err != nil {
 		return res, err
 	}
-	sum, _, err := manifest.HashFile(im.Out)
+	sum, err := archive.HashFile(ctx, im.Out) // Stop works here too: a big image takes minutes
 	if err != nil {
 		return res, err
 	}
 	x.meta.SHA256, x.meta.Complete = sum, true
 	if im.Compress {
-		if _, err := archive.CompressImage(ctx, out, im.Out, im.Out+".xz", im.KeepRaw, nil); err != nil {
+		if _, err := archive.CompressImageSum(ctx, out, im.Out, im.Out+".xz", im.KeepRaw, sum, nil); err != nil {
 			im.save(out, x.m, x.meta)
 			return res, fmt.Errorf("compressing the image: %w (the raw image is kept)", err)
 		}

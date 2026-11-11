@@ -3,7 +3,10 @@ package elevate
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -85,5 +88,15 @@ func TestIsAdminDoesNotPanic(t *testing.T) { _ = IsAdmin() }
 func TestWindowsChildParamsMarkWindow(t *testing.T) {
 	if got, want := childParams([]string{"image", "--from", "E:"}), "image --from E: "+WindowFlag; got != want {
 		t.Fatalf("got %s want %s", got, want)
+	}
+}
+
+// Adversarial pass R5: the command shown when admin rights are needed used the bare program
+// name, which an unpacked download (not on PATH) can't be started by. It names the full path.
+func TestInstructionUsesFullPath(t *testing.T) {
+	exe, _ := os.Executable()
+	got := Instruction([]string{"gui"})
+	if !strings.Contains(got, filepath.Base(exe)) || !strings.Contains(got, string(filepath.Separator)) {
+		t.Fatalf("instruction %q doesn't name %s by its path", got, exe)
 	}
 }

@@ -93,6 +93,12 @@ func Main(args []string, io IO) (code int) {
 	switch {
 	case err == nil:
 		return ExitOK
+	case ctx.Err() != nil && (errors.Is(err, errNoAnswer) || errors.Is(err, context.Canceled)):
+		fmt.Fprintln(io.Err, "Interrupted. Run the same command again to resume.")
+		return ExitInterrupted // Ctrl+C, even at a question
+	case errors.Is(err, errNoAnswer): // the terminal closed at a question: nothing was started
+		fmt.Fprintln(io.Err, err)
+		return ExitUsage
 	case errors.As(err, &ee):
 		if ee.msg != "" {
 			fmt.Fprintln(io.Err, ee.msg)
@@ -318,7 +324,8 @@ func adminFlow(ctx context.Context, io IO, args []string) error {
 		return exit(ExitAdmin, "This needs administrator rights.\n  %s", instr)
 	}
 	fmt.Fprint(io.Err, "This needs administrator rights. Restart as Administrator/root? [Y/n] ")
-	if a := readLine(io.In); a != "" && !strings.HasPrefix(strings.ToLower(a), "y") {
+	// no answer (EOF, Ctrl+C) is no: nothing is restarted for someone who didn't say yes
+	if a, ok := readAnswer(ctx, io.In); !ok || a != "" && !strings.HasPrefix(strings.ToLower(a), "y") {
 		return exit(ExitAdmin, "Not elevated.\n  %s", instr)
 	}
 	if runtime.GOOS == "windows" {

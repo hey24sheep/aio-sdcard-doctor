@@ -3,6 +3,7 @@ package carve
 import (
 	"compress/flate"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"strings"
@@ -11,10 +12,21 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/profile"
 )
 
-// PDF: the last %%EOF before the next %PDF- (or 8 MiB without another %%EOF, or the cap).
-var pdfFormat = Format{Name: "pdf", Ext: "pdf", Cat: profile.Documents, MaxSize: 1 * gib,
+// PDF: a linearized file's own length (/L), else the last %%EOF before the next %PDF- (or 8 MiB
+// without another %%EOF, or the cap); the end's startxref must point at an xref table or object
+// inside it, or it is the tail of some other PDF. Scan keeps looking inside its range.
+var pdfFormat = Format{Name: "pdf", Ext: "pdf", Cat: profile.Documents, MaxSize: 1 * gib, HeaderSized: true,
 	Magics: []Magic{m(0, "%PDF-")}, Size: sizer(func(x *rd) (int64, error) {
+		if l := pdfLinearizedLen(x); l > 0 {
+			return l, nil
+		}
 		pos, last := int64(5), int64(-1)
+		end := func() (int64, error) {
+			if !pdfXrefOK(x, last) {
+				return 0, errTrunc
+			}
+			return last, nil
+		}
 		for {
 			stop := x.limit
 			if last >= 0 {
@@ -23,7 +35,7 @@ var pdfFormat = Format{Name: "pdf", Ext: "pdf", Cat: profile.Documents, MaxSize:
 			i, pat, err := x.find(pos, stop, []byte("%%EOF"), []byte("%PDF-"))
 			if err != nil {
 				if last >= 0 && (errors.Is(err, errNotFound) || errors.Is(err, errTrunc)) {
-					return last, nil
+					return end()
 				}
 				return 0, err
 			}
@@ -31,7 +43,7 @@ var pdfFormat = Format{Name: "pdf", Ext: "pdf", Cat: profile.Documents, MaxSize:
 				if last < 0 {
 					return 0, errBad
 				}
-				return last, nil
+				return end()
 			}
 			e := i + 5
 			if b, err := x.bytes(e, 2); err == nil && string(b) == "\r\n" {
@@ -42,6 +54,93 @@ var pdfFormat = Format{Name: "pdf", Ext: "pdf", Cat: profile.Documents, MaxSize:
 			last, pos = e, i+5
 		}
 	})}
+
+// pdfLinearizedLen is the length a linearized PDF states in its first object (/L), when the
+// file really ends with %%EOF there; 0 otherwise.
+func pdfLinearizedLen(x *rd) int64 {
+	h, err := x.bytes(0, int(min(1024, x.limit)))
+	if err != nil {
+		return 0
+	}
+	i := strings.Index(string(h), "/Linearized")
+	if i < 0 {
+		return 0
+	}
+	j := strings.Index(string(h[i:]), "/L ")
+	if j < 0 {
+		return 0
+	}
+	var l int64
+	for _, c := range h[i+j+3:] {
+		if c < '0' || c > '9' {
+			break
+		}
+		l = l*10 + int64(c-'0')
+	}
+	if l < 64 || l > x.limit {
+		return 0
+	}
+	t, err := x.bytes(l-64, 64)
+	if err != nil || !strings.Contains(string(t), "%%EOF") {
+		return 0
+	}
+	return l
+}
+
+// pdfXrefOK checks the startxref before a PDF's end points at an xref table or an object inside
+// the file. Without a startxref there is nothing to check.
+func pdfXrefOK(x *rd, end int64) bool {
+	from := max(0, end-1100)
+	b, err := x.bytes(from, int(end-from))
+	if err != nil {
+		return true
+	}
+	k := strings.LastIndex(string(b), "startxref")
+	if k < 0 {
+		return true
+	}
+	var n int64
+	digits := 0
+	for _, c := range b[k+len("startxref"):] {
+		if c >= '0' && c <= '9' {
+			n, digits = n*10+int64(c-'0'), digits+1
+		} else if digits > 0 {
+			break
+		}
+	}
+	if digits == 0 || n >= end {
+		return false
+	}
+	t, err := x.bytes(n, int(min(32, end-n)))
+	if err != nil {
+		return false
+	}
+	s := string(t)
+	if strings.HasPrefix(s, "xref") {
+		return true
+	}
+	var a, g int // an xref stream: "12 0 obj"
+	var w string
+	c, _ := fmt.Sscanf(s, "%d %d %s", &a, &g, &w)
+	return c == 3 && strings.HasPrefix(w, "obj")
+}
+
+// apkSigBlock returns the size (after its first size field) of an APK Signing Block at pos.
+func apkSigBlock(x *rd, pos int64) (int64, bool) {
+	h, err := x.bytes(pos, 8)
+	if err != nil {
+		return 0, false
+	}
+	n := le32(h) | le32(h[4:])<<32
+	if n < 24 || n > 64*mib {
+		return 0, false
+	}
+	t, err := x.bytes(pos+8+n-16, 16)
+	if err != nil || string(t) != "APK Sig Block 42" {
+		return 0, false
+	}
+	return n, true
+}
 
 var zipMethods = map[int64]bool{0: true, 1: true, 6: true, 8: true, 9: true, 12: true, 14: true, 93: true, 95: true, 98: true, 99: true}
 
@@ -58,6 +157,14 @@ func zipWalk(x *rd, entry func(name string, data, method, csize int64)) (int64, 
 			return 0, err
 		}
 		if sig[0] != 'P' || sig[1] != 'K' {
+			// an Android APK Signing Block sits between the last file and the central directory:
+			// u64 size, entries, u64 size again, then the magic "APK Sig Block 42"
+			if files > 0 {
+				if n, ok := apkSigBlock(x, pos); ok {
+					pos += 8 + n
+					continue
+				}
+			}
 			return 0, errBad
 		}
 		switch string(sig[2:]) {

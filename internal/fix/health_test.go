@@ -26,6 +26,7 @@ type memCard struct {
 	wbadTo     int64
 	pulledFrom int64 // > 0: every read at or past this offset fails (card pulled while reading)
 	dropFrom   int64 // > 0: writes past this are silently dropped and read back as zeros (a fake)
+	gone       bool  // pulled: reads fail everywhere
 }
 
 var errUnplugged = errors.New("device gone")
@@ -59,7 +60,19 @@ func (m *memCard) WriteAt(p []byte, off int64) (int, error) {
 func (m *memCard) ReadAt(p []byte, off int64) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if off < m.badTo && off+int64(len(p)) > m.badFrom || m.pulledFrom > 0 && off+int64(len(p)) > m.pulledFrom {
+	// a pulled card answers nothing: once unplugged (writes past failAfter, or a read reaching
+	// pulledFrom), every read fails until the test puts it back
+	unplugged := m.failAfter > 0 && m.writes > m.failAfter
+	if m.pulledFrom > 0 && (m.gone || off+int64(len(p)) > m.pulledFrom) {
+		m.gone, unplugged = true, true
+	}
+	if m.pulledFrom == 0 {
+		m.gone = false
+	}
+	if unplugged {
+		return 0, errUnplugged
+	}
+	if off < m.badTo && off+int64(len(p)) > m.badFrom {
 		return 0, errors.New("I/O error")
 	}
 	for i := range p {

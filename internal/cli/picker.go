@@ -46,7 +46,11 @@ func sortDrives(ds []drives.Drive) {
 // noFromMessage is shown when a script gives no --from: what was found, and whether a card was.
 func noFromMessage(cmd string) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%s: --from is required (a card, USB drive, internal drive, folder or image file).\n", cmd)
+	if cmd == "fix --drive" { // card tools name the card itself, not a source to copy from
+		b.WriteString("fix: --drive is required (the card's drive letter or mount point, or its disk).\n")
+	} else {
+		fmt.Fprintf(&b, "%s: --from is required (a card, USB drive, internal drive, folder or image file).\n", cmd)
+	}
 	ds, _ := listDrivesFn()
 	sortDrives(ds)
 	if len(ds) == 0 || !ds[0].Removable {

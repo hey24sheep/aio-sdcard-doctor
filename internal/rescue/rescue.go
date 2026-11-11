@@ -92,6 +92,7 @@ type Rescue struct {
 
 	src      Source
 	scanned  bool
+	unlock   func() // the per-card lock, taken by Plan, released by Run (when it ends) or Close
 	inv      scan.Inventory
 	selected []scan.Item
 	excluded map[string]string // rel → why (user's choice)
@@ -194,6 +195,10 @@ func (r *Rescue) Inventory() scan.Inventory { return r.inv }
 
 // Close releases the reader process.
 func (r *Rescue) Close() error {
+	if r.unlock != nil { // planned but never run
+		r.unlock()
+		r.unlock = nil
+	}
 	if r.src != nil {
 		err := r.src.Close()
 		r.src = nil
@@ -237,15 +242,6 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	if len(r.Profiles) == 0 || (len(r.Profiles) == 1 && r.Profiles[0] == "auto") {
 		active = profile.Detect(r.src)
 	}
-	inv := r.inv
-	if !r.scanned { // planning again after a menu answer reuses the scan: fewer reads of the card
-		var err error
-		if inv, err = scan.Scan(ctx, r.src, active); err != nil {
-			return p, err
-		}
-		r.inv, r.scanned = inv, true
-	}
-	r.selected, r.excluded = Select(inv, r.Selection())
 	r.srcDrive, _ = r.LookupDrive(r.From)
 	if r.Raw {
 		r.srcDrive.Root = ""
@@ -257,6 +253,28 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 			r.srcDrive = drives.Drive{Removable: true} // a card image file: only the file itself is the source
 		}
 	}
+	// one run per card (R14), from the first read: the plan scans the card, so it takes the lock
+	if r.unlock == nil {
+		u, err := job.LockSource(lockKey(r.src.Identity(), r.From, r.srcDrive.Removable))
+		if errors.Is(err, job.ErrSourceBusy) {
+			p.Issues = append(p.Issues, job.Issue{Kind: "busy", Severity: job.Block, Title: err.Error(),
+				Detail: "Finish or close the other window first.", Choices: []job.Choice{job.Stop}, Default: job.Stop})
+			return p, nil
+		}
+		if err != nil {
+			return p, err
+		}
+		r.unlock = u
+	}
+	inv := r.inv
+	if !r.scanned { // planning again after a menu answer reuses the scan: fewer reads of the card
+		var err error
+		if inv, err = scan.Scan(ctx, r.src, active); err != nil {
+			return p, err
+		}
+		r.inv, r.scanned = inv, true
+	}
+	r.selected, r.excluded = Select(inv, r.Selection())
 	r.dstDrive, _ = r.LookupDrive(r.Dest)
 	in := preflight.Input{Action: "rescue", Src: r.srcDrive, Dst: r.dstDrive, DstPath: r.Dest, Items: r.selected,
 		Suggested: undecided(inv.Suggested, r.Selection()), Admin: elevate.IsAdmin(), NeedsAdmin: r.Raw && IsDevicePath(r.From)}
@@ -451,27 +469,30 @@ func fsCaps(src Source) []job.Capability {
 
 // run is one Run's state.
 type run struct {
-	r       *Rescue
-	env     job.Env
-	ctx     context.Context
-	cancel  context.CancelFunc
-	out     destfs.FS
-	sink    archive.Sink
-	m       *manifest.Manifest
-	plan    *paths.Planner
-	copier  *salvage.Copier
-	from    string
-	id      drives.Identity
-	counts  map[string]int
-	sum     report.Summary
-	mon     monitor
-	done    int64
-	total   int64
-	thr     job.Throttle
-	skipVid bool
-	giveUp  bool // the user chose to skip the rest after the card stopped responding
-	st      *job.Store
-	keptBad int // rows from an earlier run, outside this choice, that are not fully copied
+	r          *Rescue
+	env        job.Env
+	ctx        context.Context
+	cancel     context.CancelFunc
+	out        destfs.FS
+	sink       archive.Sink
+	m          *manifest.Manifest
+	plan       *paths.Planner
+	copier     *salvage.Copier
+	from       string
+	id         drives.Identity
+	counts     map[string]int
+	sum        report.Summary
+	mon        monitor
+	done       int64
+	total      int64
+	thr        job.Throttle
+	skipVid    bool
+	giveUp     bool // the user chose to skip the rest after the card stopped responding
+	st         *job.Store
+	keptBad    int // rows from an earlier run, outside this choice, that are not fully copied
+	zparts     archive.ZipParts
+	destSerial string // the destination volume's serial when the run started ("" if unknown)
+	destMoved  bool   // the card came back where the destination was: nothing more is written
 }
 
 func (x *run) ask(is job.Issue) job.Choice {
@@ -537,9 +558,13 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		}
 	}
 	id := r.src.Identity()
-	unlock, err := job.LockSource(lockKey(id, r.From, r.srcDrive.Removable))
-	if err != nil {
-		return job.Result{}, err
+	unlock := r.unlock // taken by Plan; held until this run ends
+	r.unlock = nil
+	if unlock == nil {
+		var err error
+		if unlock, err = job.LockSource(lockKey(id, r.From, r.srcDrive.Removable)); err != nil {
+			return job.Result{}, err
+		}
 	}
 	defer unlock()
 	if release, err := job.Inhibit("copying files off a card"); err == nil {
@@ -555,7 +580,7 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	defer cancel()
 	x := &run{r: r, env: env, ctx: rctx, cancel: cancel, out: out, m: m, st: st, copier: salvage.NewCopier(),
 		from: r.From, id: id, counts: map[string]int{}, plan: paths.NewPlanner(r.Dest, paths.MaxPath),
-		thr: job.Throttle{Every: 100 * time.Millisecond}}
+		thr: job.Throttle{Every: 100 * time.Millisecond}, destSerial: drives.VolumeSerial(r.Dest)}
 	x.sink = archive.FolderSink(out, r.Dest)
 	if r.Compress {
 		x.sink = archive.ZipSink(out, r.Dest, st)
@@ -567,6 +592,9 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	}
 	x.recordExcluded()
 	again, runErr := x.loop(r.selected)
+	if x.destMoved { // the destination's path now leads to the card: write nothing more, not even reports
+		return job.Result{Counters: x.counts}, runErr
+	}
 	if runErr == nil && len(again) > 0 {
 		runErr = x.retryQueue(again)
 	}
@@ -596,15 +624,39 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 // files were never seen, so they can't be listed one by one): nothing on the card disappears
 // silently, the run isn't "clean", and a later verify or Fix knows the rescue is incomplete.
 func (x *run) recordUnlistable() {
-	for _, u := range x.r.inv.Unlistable {
-		dir, why, _ := strings.Cut(u, ": ")
-		e := manifest.Entry{Source: strings.TrimSuffix(dir, "/") + "/", Status: manifest.FAILED,
-			Error: "folder could not be listed (possible damage) — the files in it were not copied: " + why}
+	now := map[string]bool{}
+	put := func(e manifest.Entry) {
 		if err := x.m.Put(e); err != nil {
 			x.log("warn", err.Error())
-			continue
+			return
 		}
 		x.count(manifest.FAILED)
+		x.sum.Add(e)
+	}
+	for _, u := range x.r.inv.Unlistable {
+		dir, why, _ := strings.Cut(u, ": ")
+		src := strings.TrimSuffix(dir, "/") + "/"
+		now[src] = true
+		put(manifest.Entry{Source: src, Status: manifest.FAILED,
+			Error: "folder could not be listed (possible damage) — the files in it were not copied: " + why})
+	}
+	for _, u := range x.r.inv.Unreadable {
+		f, why, _ := strings.Cut(u, ": ")
+		put(manifest.Entry{Source: f, Status: manifest.FAILED, Error: "its details could not be read (possible damage) — not copied: " + why})
+	}
+	// a folder that couldn't be listed before and was listed this time: its old row goes
+	var stale []string
+	x.m.Each(func(e manifest.Entry) error {
+		if strings.HasSuffix(e.Source, "/") && e.Status == manifest.FAILED && !now[e.Source] {
+			stale = append(stale, e.Source)
+		}
+		return nil
+	})
+	for _, s := range stale {
+		x.m.Delete(s)
+	}
+	if n := len(x.r.inv.Unreadable); n > 0 {
+		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%d files could not be read at all (possible damage) — try Image, or Find deleted files with Deep scan", n))
 	}
 	if n := len(x.r.inv.Unlistable); n > 0 {
 		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%d folders could not be listed; their files were not copied — try Image, or Find deleted files with Deep scan", n))
@@ -625,8 +677,11 @@ func (x *run) count(st manifest.Status) { x.counts[string(st)]++ }
 // whichever form an earlier run stored it (a folder or a ZIP part), so switching "compress"
 // between runs never reads the card again for files already saved.
 func (x *run) stored(dest string, size int64) bool {
-	if strings.Contains(dest, ".zip/") {
-		return archive.ZipIndexHas(x.st, dest, size)
+	if _, _, ok := archive.ZipPart(dest); ok {
+		if x.zparts == nil {
+			x.zparts = archive.ZipParts{}
+		}
+		return x.zparts.Stored(x.st, x.r.Dest, dest, size)
 	}
 	return archive.FolderSink(x.out, x.r.Dest).Has(dest, size)
 }
@@ -741,6 +796,8 @@ func (x *run) retryQueue(q []scan.Item) error {
 func (x *run) uncount(rel string) {
 	if e, ok, _ := x.m.Get(rel); ok && x.counts[string(e.Status)] > 0 {
 		x.counts[string(e.Status)]--
+		x.sum.Remove(e)                 // the summary counts it once too
+		x.done = max(0, x.done-e.Bytes) // and progress doesn't pass 100%
 	}
 }
 
@@ -842,8 +899,8 @@ func (x *run) copyOne(it scan.Item, dest string, old manifest.Entry, had bool, e
 		return string(ch)
 	}}
 	accept := func(res salvage.Result) bool {
-		if !had {
-			return true
+		if !had || x.r.Fresh || old.Bytes != it.Size || !sameTime(old.SrcMTime, it.MTime) {
+			return true // nothing yet, Start over, or the file changed on the card: the new copy wins
 		}
 		cand := manifest.Entry{Status: manifest.OK, BadBytes: res.Bad}
 		if res.Bad > 0 {
@@ -952,6 +1009,15 @@ func (x *run) cardGone() (gone, retry bool, err error) {
 		if werr != nil {
 			return true, false, fmt.Errorf("the card did not come back: %w", werr)
 		}
+	}
+	// The card is back somewhere else: never write there either, and make sure the destination
+	// didn't move with it (a hub reset can bring both back with their letters or mount points
+	// swapped — the card could now be where the destination was).
+	destfs.Protect(x.out, root)
+	if preflight.Under(drives.RealPath(x.r.Dest), drives.RealPath(root)) ||
+		x.destSerial != "" && drives.VolumeSerial(x.r.Dest) != x.destSerial {
+		x.destMoved = true
+		return true, false, errors.New("stopped: when the card came back, the destination folder was no longer on the same disk (drive letters or mount points changed) — check where both are, then run again")
 	}
 	x.from = root
 	spec := x.r.spec()

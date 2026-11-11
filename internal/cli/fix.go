@@ -14,6 +14,8 @@ import (
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/fix"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/fsread"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/source"
 )
 
 // Seams for fix (tests use a made-up card; TestMain traps real tools and devices).
@@ -22,6 +24,48 @@ var (
 	fixGOOS       = runtime.GOOS
 	fixStoreDir   = "" // "" = the user's config folder
 )
+
+// probeVolume reads an unmounted volume's boot sector, read-only: Linux needs the card unmounted
+// for repair, format and the health test, and an unmounted volume is listed without its label,
+// file system or serial (a seam: tests never open a device).
+var probeVolume = func(dev string) (fsread.Volume, bool) {
+	r, size, c, err := source.OpenRawDevice(dev)
+	if err != nil {
+		return fsread.Volume{}, false
+	}
+	defer c.Close()
+	vs, err := fsread.Probe(r, size)
+	if err != nil || len(vs) == 0 || vs[0].FS == "unknown" {
+		return fsread.Volume{}, false
+	}
+	return vs[0], true
+}
+
+// describeUnmounted fills in what the boot sector says about an unmounted volume: its label (so
+// Format keeps it, and it is what you type to confirm), file system and serial (so a rescue of
+// this card can vouch for it).
+func describeUnmounted(t *fix.Target) {
+	if t.Vol.Root != "" || t.Vol.Device == "" || t.Vol.ID.FSSerial != "" {
+		return
+	}
+	v, ok := probeVolume(t.Vol.Device)
+	if !ok {
+		return
+	}
+	if t.Vol.Label == "" {
+		t.Vol.Label = v.Label
+	}
+	if t.Vol.FS == "" {
+		t.Vol.FS = v.FS
+	}
+	t.Vol.ID.FSSerial, t.Vol.ID.Label = v.Serial, t.Vol.Label
+}
+
+// sameRoot: p names the volume root (case-insensitive, trailing separators ignored).
+func sameRoot(p, root string) bool {
+	t := func(s string) string { return strings.ToLower(strings.TrimRight(filepath.Clean(s), `\/`)) }
+	return root != "" && t(p) == t(root)
+}
 
 // findTarget resolves --drive: a drive letter / mount point, or a whole disk (\\.\PhysicalDrive2,
 // /dev/sdb, /dev/disk4) for a card with no mounted volume.
@@ -50,6 +94,10 @@ func findTarget(drive string) (fix.Target, error) {
 	v, err := lookupDrive(normFrom(drive))
 	if err != nil {
 		return fix.Target{}, err
+	}
+	// the card's volume itself, never a folder on it: "E:\DCIM" or "." must not mean the whole card
+	if !sameRoot(drive, v.Root) && !sameRoot(normFrom(drive), v.Root) {
+		return fix.Target{}, fmt.Errorf("--drive takes the card itself (%s), not a folder on it (%s)", v.Root, drive)
 	}
 	for _, d := range ds {
 		if d.PhysicalID != "" && d.PhysicalID == v.PhysicalID {
@@ -124,6 +172,13 @@ func fixCmd(io IO, g *globals) *cobra.Command {
 				return exit(ExitUsage, "%s", noFromMessage("fix --drive"))
 			}
 			t, err := findTarget(drive)
+			describeUnmounted(&t)
+			// a whole disk named, with several partitions: check, repair and format act on one
+			// partition, so say which (the health test is the one that takes the whole disk)
+			if err == nil && ops[0] != fix.OpHealth && strings.EqualFold(drive, t.Disk.Path) && len(t.Disk.Volumes) > 1 {
+				return exit(ExitUsage, "fix: %s has %d partitions — name the one to %s (its drive letter, mount point or partition device)",
+					drive, len(t.Disk.Volumes), ops[0])
+			}
 			if err != nil {
 				return exit(ExitError, "fix: %v", err)
 			}
@@ -134,7 +189,8 @@ func fixCmd(io IO, g *globals) *cobra.Command {
 			exe, _ := os.Executable()
 			bin, _ := lookupDrive(exe)
 			f := &fix.Fix{Op: ops[0], Target: t, Verified: verified, AllowFixed: allowFixed, NewLabel: label,
-				Replug: !noReplug, NewTest: newTest, BinaryDisk: bin.PhysicalID, Out: io.Out, GOOS: fixGOOS, Admin: isAdmin,
+				// a script (--yes, no terminal) has nobody to unplug the card: no replug step
+				Replug: !noReplug && io.TTY && !g.yes, NewTest: newTest, BinaryDisk: bin.PhysicalID, Out: io.Out, GOOS: fixGOOS, Admin: isAdmin,
 				StoreDir: fixStoreDir, ListDevices: listDevicesFn}
 			typed := func() error {
 				if f.Op != fix.OpCheck { // a check changes nothing
@@ -145,6 +201,7 @@ func fixCmd(io IO, g *globals) *cobra.Command {
 				// the card is looked up again right before anything runs: a card swapped while the
 				// user was reading or typing is never touched
 				now, err := findTarget(drive)
+				describeUnmounted(&now)
 				if err != nil || !sameCard(t, now) {
 					return exit(ExitError, "The card changed since you confirmed (unplugged or swapped) — nothing was done. Run the command again.")
 				}
@@ -191,10 +248,10 @@ func typedConfirm(ctx context.Context, io IO, t fix.Target, label, size string) 
 		fmt.Fprintf(io.Err, "\nThis erases or changes the card. To go on, type its label (%s) and size (%s).\n", fix.ConfirmLabel(t), fix.SizeText(t))
 		var err error
 		if label, err = ask(ctx, io, "Label: "); err != nil {
-			return exit(ExitError, "Cancelled — nothing was changed.")
+			return err // no answer: nothing was changed (exit 2, or 130 for Ctrl+C)
 		}
 		if size, err = ask(ctx, io, "Size: "); err != nil {
-			return exit(ExitError, "Cancelled — nothing was changed.")
+			return err
 		}
 	}
 	if err := fix.Confirm(t, label, size); err != nil {

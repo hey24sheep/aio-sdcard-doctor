@@ -111,10 +111,9 @@ func (c *Client) start() error {
 		return err
 	}
 	// After a re-plug or a restart the reader must be looking at the same card (same file-system
-	// serial, or the same size when there is none); a stranger is never read from.
+	// serial, or the same size and content samples when there is none); a stranger is never read.
 	if c.opened {
-		a, b := drives.NormalizeSerial(c.first.FSSerial), drives.NormalizeSerial(r.ID.FSSerial)
-		if (a != "" && b != "" && a != b) || (a == "" && b == "" && c.first.Size != r.ID.Size) {
+		if ok, _, _ := c.first.Matches(r.ID); !ok { // serials, else size and content samples
 			if c.p != nil {
 				c.lastReap = c.p.kill()
 				c.p = nil
@@ -385,16 +384,24 @@ func (f *remote) Close() error {
 
 type ent struct{ d DirEnt }
 
-func (e ent) Name() string               { return e.d.Name }
-func (e ent) Size() int64                { return e.d.Size }
-func (e ent) ModTime() time.Time         { return e.d.MTime }
-func (e ent) IsDir() bool                { return e.d.Dir }
-func (e ent) Sys() any                   { return nil }
-func (e ent) Type() fs.FileMode          { return e.Mode().Type() }
-func (e ent) Info() (fs.FileInfo, error) { return e, nil }
+func (e ent) Name() string       { return e.d.Name }
+func (e ent) Size() int64        { return e.d.Size }
+func (e ent) ModTime() time.Time { return e.d.MTime }
+func (e ent) IsDir() bool        { return e.d.Dir }
+func (e ent) Sys() any           { return nil }
+func (e ent) Type() fs.FileMode  { return e.Mode().Type() }
+func (e ent) Info() (fs.FileInfo, error) {
+	if e.d.Err != "" {
+		return nil, errors.New(e.d.Err)
+	}
+	return e, nil
+}
 func (e ent) Mode() fs.FileMode {
 	if e.d.Dir {
 		return fs.ModeDir | 0o555
+	}
+	if t := e.d.Mode & fs.ModeType; t != 0 {
+		return t | 0o444 // a link or special file
 	}
 	return 0o444
 }

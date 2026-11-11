@@ -3,6 +3,7 @@ package fsread
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"strings"
@@ -68,20 +69,11 @@ func (d *diskfsDriver) list(dir string) ([]node, error) {
 	if err != nil {
 		return nil, err
 	}
-	var real map[string]string // looked up only when a name came back mangled
+	var real map[string][]fatEntry // looked up only when a name came back mangled
 	var out []node
 	for _, e := range es {
 		if e.Name() == "." || e.Name() == ".." || e.Name() == "" {
 			continue
-		}
-		name := e.Name()
-		if strings.ContainsRune(name, utf8.RuneError) && d.raw != nil {
-			if real == nil {
-				real = d.realNames(dir)
-			}
-			if r, ok := real[name]; ok {
-				name = r
-			}
 		}
 		fi, err := e.Info()
 		if err != nil {
@@ -91,7 +83,18 @@ func (d *diskfsDriver) list(dir string) ([]node, error) {
 		if d.localTime {
 			mt = localTime(mt)
 		}
-		out = append(out, node{name: name, size: fi.Size(), mtime: mt, dir: fi.IsDir()})
+		n := node{name: e.Name(), size: fi.Size(), mtime: mt, dir: fi.IsDir()}
+		if strings.ContainsRune(n.name, utf8.RuneError) && d.raw != nil {
+			if real == nil {
+				real = d.realEntries(dir)
+			}
+			// names that differ only outside the BMP share go-diskfs's spelling: take our own
+			// entries in directory order, with their own sizes
+			if q := real[n.name]; len(q) > 0 {
+				n.name, n.size, n.dir, real[n.name] = q[0].name, q[0].size, q[0].dir, q[1:]
+			}
+		}
+		out = append(out, n)
 	}
 	return out, nil
 }
@@ -99,6 +102,17 @@ func (d *diskfsDriver) list(dir string) ([]node, error) {
 func (d *diskfsDriver) open(name string, n node) (io.ReaderAt, io.Closer, error) {
 	if n.size == 0 {
 		return emptyReader{}, nopCloser{}, nil
+	}
+	if d.raw != nil && diskfsName(name) != name { // go-diskfs can't tell such names apart: read the chain
+		l, err := d.layout()
+		if err != nil {
+			return nil, nil, err
+		}
+		e, ok := l.lookup(name)
+		if !ok || e.dir {
+			return nil, nil, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
+		}
+		return source.ExtentReader{Dev: d.raw, Extents: l.extents(e)}, nopCloser{}, nil
 	}
 	f, err := d.fsys.Open(d.path(name))
 	if err != nil {
@@ -149,32 +163,22 @@ func diskfsPath(p string) string {
 	return strings.Join(segs, "/")
 }
 
-// realNames maps go-diskfs's spelling of each live name in dir to the real name.
-func (d *diskfsDriver) realNames(dir string) map[string]string {
+// realEntries maps go-diskfs's spelling of each live name in dir to our own entries with that
+// spelling, in directory order (several when names differ only outside the BMP).
+func (d *diskfsDriver) realEntries(dir string) map[string][]fatEntry {
 	l, err := d.layout()
 	if err != nil {
 		return nil
 	}
-	raw := l.readDir(0, false)
-	for _, seg := range strings.Split(dir, "/") {
-		if seg == "" || seg == "." {
-			continue
-		}
-		found := false
-		for _, e := range l.entries(raw) {
-			if !e.deleted && e.dir && e.name == seg && l.valid(e.clus) {
-				raw, found = l.readDir(e.clus, false), true
-				break
-			}
-		}
-		if !found {
-			return nil
-		}
+	raw, ok := l.dirRecords(dir)
+	if !ok {
+		return nil
 	}
-	m := map[string]string{}
+	m := map[string][]fatEntry{}
 	for _, e := range l.entries(raw) {
 		if !e.deleted {
-			m[diskfsName(e.name)] = e.name
+			k := diskfsName(e.name)
+			m[k] = append(m[k], e)
 		}
 	}
 	return m

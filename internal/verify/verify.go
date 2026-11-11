@@ -25,6 +25,7 @@ import (
 
 	"github.com/ulikunitz/xz"
 
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/archive"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
@@ -111,7 +112,7 @@ func load(p string) ([]item, error) {
 			if len(r) < len(rows[0]) || (r[col["Status"]] != "OK" && r[col["Status"]] != "PARTIAL") {
 				continue
 			}
-			d := strings.ReplaceAll(recoveredPrefix.ReplaceAllString(r[col["Dest"]], ""), `\`, "/")
+			d := strings.ReplaceAll(recoveredPrefix.ReplaceAllString(report.FromCell(r[col["Dest"]]), ""), `\`, "/")
 			n, _ := strconv.ParseInt(r[col["Bytes"]], 10, 64)
 			src := d
 			if i, ok := col["Source"]; ok {
@@ -311,8 +312,7 @@ var partRe = regexp.MustCompile(`^(.+)-\d{4,}\.zip$`)
 // check verifies one file: exists, same size, same SHA-256.
 func (v *Verify) check(it item, zips map[string]*zip.ReadCloser) row {
 	r := row{Path: it.Dest, Bytes: it.Bytes}
-	if part, rest, ok := strings.Cut(it.Dest, ".zip/"); ok {
-		part += ".zip"
+	if part, rest, ok := archive.ZipPart(it.Dest); ok {
 		zp := filepath.Join(v.Target, filepath.FromSlash(part))
 		if _, err := os.Stat(zp); err == nil {
 			return v.checkZip(r, zp, rest, it, zips)
@@ -436,7 +436,15 @@ func (v *Verify) writeReports(out destfs.FS, rows []row, counts map[string]int, 
 	for _, k := range keys {
 		fmt.Fprintf(&s, "  %-12s %8d\n", k, counts[k])
 	}
-	if counts["OK"] == len(rows) {
+	partial := 0 // saved with unreadable parts zero-filled (…__PARTIAL): they match, but aren't whole
+	for _, r := range rows {
+		if strings.Contains(r.Path, "__PARTIAL") {
+			partial++
+		}
+	}
+	if counts["OK"] == len(rows) && partial > 0 {
+		fmt.Fprintf(&s, "\nALL FILES MATCH what was saved - but %d of them were saved with unreadable parts filled with zeros (named …__PARTIAL), so the copy is not whole.\n", partial)
+	} else if counts["OK"] == len(rows) {
 		s.WriteString("\nALL FILES MATCH - the copy is a perfect copy.\n")
 	} else {
 		s.WriteString("\nProblems (first 100):\n")
@@ -496,20 +504,22 @@ func (v *Verify) runImage(ctx context.Context) (job.Result, error) {
 	}
 	raw := strings.TrimSuffix(v.Image, ".xz")
 	var rd io.Reader
-	f, err := os.Open(raw)
+	// the file asked about: a named .xz is read even when the raw image is still next to it
+	f, err := os.Open(v.Image)
+	if err != nil && !strings.HasSuffix(v.Image, ".xz") {
+		f, err = os.Open(raw + ".xz") // the raw image was replaced by its .xz
+	}
 	if err != nil {
-		if f, err = os.Open(raw + ".xz"); err != nil {
-			return job.Result{}, err
-		}
-		if rd, err = xz.NewReader(f); err != nil {
-			f.Close()
-			return job.Result{}, err
-		}
-	} else {
-		rd = f
+		return job.Result{}, err
 	}
 	defer f.Close()
-	sum, err := hashReader(rd)
+	rd = f
+	if strings.HasSuffix(f.Name(), ".xz") {
+		if rd, err = xz.NewReader(f); err != nil {
+			return job.Result{}, err
+		}
+	}
+	sum, err := hashReader(stopReader{ctx, rd}) // Stop works during a long hash too
 	if err != nil {
 		return job.Result{Counters: map[string]int{"UNREADABLE": 1}}, err
 	}
@@ -517,4 +527,17 @@ func (v *Verify) runImage(ctx context.Context) (job.Result, error) {
 		return job.Result{Counters: map[string]int{"OK": 1}, Clean: true}, nil
 	}
 	return job.Result{Counters: map[string]int{"CORRUPT": 1}}, nil
+}
+
+// stopReader ends a long read (hashing a 256 GB image) when the run is stopped.
+type stopReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (s stopReader) Read(p []byte) (int, error) {
+	if err := s.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return s.r.Read(p)
 }

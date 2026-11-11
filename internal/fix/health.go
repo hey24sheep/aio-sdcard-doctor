@@ -155,6 +155,15 @@ func HealthTest(ctx context.Context, rw RW, size int64, env job.Env, opt HealthO
 		}
 	}
 	buf := alignedBuf(hChunk)
+	// stillThere tells a pulled card from a dead area: after hGone failing chunks in a row, the
+	// last block that worked is read again. A card that still answers there is present, so the
+	// failing area is bad (a failing card, or a fake refusing writes past its real size) and the
+	// test goes on; one that doesn't answer is gone, and the run stops to resume later.
+	probe, lastGood := alignedBuf(hBlock), int64(0)
+	stillThere := func() bool {
+		_, err := rw.ReadAt(probe, lastGood)
+		return err == nil || errors.Is(err, io.EOF)
+	}
 	if s.Phase == "write" {
 		bad, failing := append([]Range(nil), s.Bad...), 0
 		for off := s.Pos; off < size; off += hChunk {
@@ -165,11 +174,14 @@ func HealthTest(ctx context.Context, rw RW, size int64, env job.Env, opt HealthO
 			fillChunk(buf[:n], off, s.Seed)
 			if _, err := rw.WriteAt(buf[:n], off); err != nil {
 				if failing++; failing >= hGone {
-					return Report{}, fmt.Errorf("the card stopped taking writes at %d MB (%w) — run the same command again to continue", off>>20, err)
+					if !stillThere() {
+						return Report{}, fmt.Errorf("the card stopped taking writes at %d MB (%w) — run the same command again to continue", off>>20, err)
+					}
+					failing = 0 // present: a dead area, not a pulled card
 				}
 				bad = addBad(bad, off, n)
 			} else {
-				failing = 0
+				failing, lastGood = 0, off
 			}
 			progress("Writing the test pattern", off+n)
 			// never save past a streak of failed writes: if the card was pulled, a resume
@@ -226,13 +238,14 @@ func HealthTest(ctx context.Context, rw RW, size int64, env job.Env, opt HealthO
 			}
 			if !all {
 				failing = 0
-			} else {
-				if failing++; failing >= hGone {
+			} else if failing++; failing >= hGone {
+				if !stillThere() {
 					return Report{}, fmt.Errorf("the card stopped answering at %d MB (%w) — run the same command again to continue", off>>20, rerr)
 				}
+				failing = 0 // present: a dead area, not a pulled card
 			}
 		} else {
-			failing = 0
+			failing, lastGood = 0, off
 			for i := int64(0); i < n; i += hBlock {
 				k := min(hBlock, n-i)
 				s.checkBlock(buf[i:i+k], off+i, exp)

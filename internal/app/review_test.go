@@ -158,3 +158,67 @@ func TestBackFromElevateLeavesIt(t *testing.T) {
 	time.Sleep(100 * time.Millisecond) // a re-plan would have landed on elevate again by now
 	r.waitStep(t, StepOptions)
 }
+
+// Adversarial pass U1: the typed confirmation was decided from the editable request. Changing
+// the card tool on the check page (two requests out of order, or any client) let a format plan
+// start with no typed label and size.
+func TestTypedConfirmFollowsWhatWasPlanned(t *testing.T) {
+	r := newRig(t)
+	r.do(t, "select-drive", "root", card.Root)
+	r.do(t, "choose-action", "action", "fix")
+	r.waitStep(t, StepOptions)
+	r.do(t, "set-option", "name", "fix-op", "value", "format")
+	r.do(t, "next")
+	r.waitStep(t, StepReview)
+	r.s.Do(Command{Name: "set-option", Args: map[string]string{"name": "fix-op", "value": "check"}}) // must not change the plan
+	if err := r.s.Do(Command{Name: "start"}); err == nil {
+		t.Fatal("the planned format started without the typed label and size")
+	}
+}
+
+// Adversarial pass (minor): a double-clicked Start left "finish or stop the current run first"
+// on the run page until the run ended.
+func TestSecondStartLeavesNoError(t *testing.T) {
+	r := newRig(t)
+	block := make(chan struct{})
+	r.mutate = func(a *fakeAction) {
+		a.run = func(ctx context.Context, env job.Env) (job.Result, error) {
+			select {
+			case <-block:
+			case <-ctx.Done():
+			}
+			return job.Result{Clean: true}, nil
+		}
+	}
+	r.do(t, "select-drive", "root", card.Root)
+	r.do(t, "quick-rescue")
+	r.waitStep(t, StepReview)
+	r.do(t, "start")
+	r.s.Do(Command{Name: "start"}) // the second click
+	if v := r.s.View(); v.Error != "" {
+		t.Fatalf("error on the run page: %q", v.Error)
+	}
+	close(block)
+}
+
+// Adversarial pass (minor): Back from the scan's check page jumped to the card list, and Back
+// after a "What next" choice went to the old run's results. Both go to "What to do".
+func TestBackGoesToWhatToDo(t *testing.T) {
+	r := newRig(t)
+	r.do(t, "select-drive", "root", card.Root)
+	r.do(t, "choose-action", "action", "scan")
+	r.waitStep(t, StepReview)
+	r.do(t, "back")
+	if st := r.s.View().Step; st != StepAction {
+		t.Fatalf("Back from the scan check went to %s", st)
+	}
+	r.do(t, "quick-rescue")
+	r.waitStep(t, StepReview)
+	r.do(t, "start")
+	r.waitStep(t, StepResults)
+	r.do(t, "next-action", "action", "verify")
+	r.do(t, "back")
+	if st := r.s.View().Step; st != StepAction {
+		t.Fatalf("Back after What next went to %s", st)
+	}
+}

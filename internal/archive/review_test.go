@@ -239,3 +239,35 @@ func TestCompressCancelWithSlowWriterReturns(t *testing.T) {
 		t.Fatal("compression did not return after cancel")
 	}
 }
+
+// Adversarial pass (minor): a crash left a multi-GB half-written file in <dest>/.aio-tmp for good,
+// and the empty folder stayed in every destination. Closing the sink cleans up what is ours.
+func TestFolderSinkCloseCleansTmp(t *testing.T) {
+	root := t.TempDir()
+	tmp := filepath.Join(root, TmpDir)
+	os.MkdirAll(tmp, 0o755)
+	left := filepath.Join(tmp, "0123456789abcdef0123456789abcdef01234567.tmp")
+	os.WriteFile(left, []byte("half a video"), 0o644)
+	other := filepath.Join(tmp, "notes.txt") // not ours: kept
+	os.WriteFile(other, []byte("x"), 0o644)
+	if err := FolderSink(destfs.New(root), root).Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(left); err == nil {
+		t.Error("leftover temp file kept")
+	}
+	if _, err := os.Stat(other); err != nil {
+		t.Error("a file that isn't ours was removed")
+	}
+}
+
+// Adversarial pass C8: Stop did nothing while a finished image was hashed (minutes on a big card).
+func TestHashFileStops(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "card.img")
+	os.WriteFile(p, make([]byte, 1<<20), 0o644)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := HashFile(ctx, p); !errors.Is(err, context.Canceled) {
+		t.Fatalf("hash ran on after Stop: %v", err)
+	}
+}

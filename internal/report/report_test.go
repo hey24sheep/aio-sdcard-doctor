@@ -91,3 +91,16 @@ func TestSummaryListsUnrecoverableWithPaths(t *testing.T) {
 		}
 	}
 }
+
+// Adversarial pass (minor): a card file named "=HYPERLINK(...)" became a live formula when the
+// report was opened in a spreadsheet. Such cells start with ' — and read back unchanged.
+func TestCellNeutralizesFormulas(t *testing.T) {
+	for _, s := range []string{"=HYPERLINK(\"x\")", "+1", "-cmd", "@SUM(A1)"} {
+		if c := Cell(s); c[0] != '\'' || FromCell(c) != s {
+			t.Errorf("%q → %q → %q", s, c, FromCell(c))
+		}
+	}
+	if Cell("DCIM/a.jpg") != "DCIM/a.jpg" {
+		t.Error("an ordinary name changed")
+	}
+}

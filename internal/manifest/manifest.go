@@ -91,6 +91,9 @@ func (m *Manifest) SaveMeta() error { return job.Put(m.s, bucketMeta, keyMeta, *
 // Put records e under its Source path (one fsync'd transaction).
 func (m *Manifest) Put(e Entry) error { return job.Put(m.s, bucketEntries, e.Source, e) }
 
+// Delete removes a row (a folder row that no longer applies).
+func (m *Manifest) Delete(src string) error { return job.Delete(m.s, bucketEntries, src) }
+
 // Get returns the entry for a source path.
 func (m *Manifest) Get(src string) (Entry, bool, error) {
 	return job.Get[Entry](m.s, bucketEntries, src)

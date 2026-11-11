@@ -37,6 +37,7 @@ type Inventory struct {
 	Items      []Item
 	Unlistable []string // folders that could not be listed (possible damage), with the error
 	Links      []string // symbolic links and special files: listed, not followed or copied
+	Unreadable []string // files whose details (size, date) could not be read, with the error
 	Profiles   []string
 	Suggested  map[string]Group
 }
@@ -93,7 +94,7 @@ func Scan(ctx context.Context, src source.Source, active []profile.Profile) (Inv
 		}
 		fi, err := d.Info()
 		if err != nil {
-			inv.Unlistable = append(inv.Unlistable, p+": "+err.Error())
+			inv.Unreadable = append(inv.Unreadable, p+": "+err.Error())
 			return nil
 		}
 		if !fi.Mode().IsRegular() && fi.Mode()&fs.ModeType != 0 {

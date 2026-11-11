@@ -30,7 +30,7 @@ func label(c job.Choice) string {
 
 // errNoAnswer: the terminal closed (EOF) or Ctrl+C at a question. Nothing is ever chosen for
 // the user in that case.
-var errNoAnswer = errors.New("no answer — nothing was started")
+var errNoAnswer = errors.New("no answer — nothing was started or changed")
 
 // lines delivers a reader's lines from one background goroutine, so a question can give up on
 // Ctrl+C without losing or blocking later input. The channel closes at EOF.

@@ -6,6 +6,7 @@ package worker
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -48,6 +49,8 @@ type DirEnt struct {
 	Size  int64
 	MTime time.Time
 	Dir   bool
+	Mode  fs.FileMode // type bits only: a symbolic link or special file is listed, never followed
+	Err   string      // its details couldn't be read (possible damage): reported, not dropped
 }
 
 // OpenReply describes what was opened.
@@ -152,7 +155,8 @@ func (s *Service) Open(spec Spec, r *OpenReply) (err error) {
 	s.dev, s.devSize, s.closers = dev, size, append(s.closers, c)
 	vols, err := fsread.Probe(dev, size)
 	if err != nil {
-		*r = OpenReply{Kind: "unknown", ReadErr: err.Error()}
+		*r = OpenReply{Kind: "unknown", ReadErr: err.Error(),
+			ID: drives.Identity{Size: uint64(size), Fingerprint: rawSamples(dev, size)}}
 		return nil
 	}
 	if spec.Volume < 0 || spec.Volume >= len(vols) {
@@ -161,6 +165,9 @@ func (s *Service) Open(spec Spec, r *OpenReply) (err error) {
 	v := vols[spec.Volume]
 	*r = OpenReply{Kind: v.FS, Volumes: vols, Caps: fsread.Capabilities(&v, nil),
 		ID: drives.Identity{Size: uint64(size), FSSerial: v.Serial, Label: v.Label}}
+	if drives.NormalizeSerial(v.Serial) == "" {
+		r.ID.Fingerprint = rawSamples(dev, size) // no serial (RAW card): tell same-size cards apart
+	}
 	src, err := fsread.Open(dev, v)
 	if err != nil {
 		r.ReadErr = err.Error()
@@ -191,11 +198,13 @@ func (s *Service) ReadDir(name string, r *[]DirEnt) (err error) {
 	}
 	out := make([]DirEnt, 0, len(es))
 	for _, e := range es {
+		typ := e.Type() & fs.ModeType // from the directory entry: a link is not followed to find it
 		fi, err := e.Info()
 		if err != nil {
+			out = append(out, DirEnt{Name: e.Name(), Dir: e.IsDir(), Mode: typ, Err: err.Error()})
 			continue
 		}
-		out = append(out, DirEnt{Name: e.Name(), Size: fi.Size(), MTime: fi.ModTime(), Dir: e.IsDir()})
+		out = append(out, DirEnt{Name: e.Name(), Size: fi.Size(), MTime: fi.ModTime(), Dir: e.IsDir(), Mode: typ})
 	}
 	*r = out
 	return nil
@@ -497,4 +506,25 @@ func (s *Service) Validate(a ValidateArgs, r *ValidateReply) (err error) {
 		}
 	}
 	return nil
+}
+
+// rawSamples fingerprints a card without a file-system serial: hashes of a few fixed 4 KiB
+// blocks, so two unreadable cards of the same size are not taken for one. An unreadable block
+// is recorded as "" and skipped when comparing.
+func rawSamples(r io.ReaderAt, size int64) []drives.FPBlock {
+	var out []drives.FPBlock
+	seen := map[int64]bool{}
+	b := make([]byte, 4096)
+	for _, off := range []int64{0, 64 << 10, 1 << 20, 16 << 20, size / 2 &^ 4095} {
+		if off+int64(len(b)) > size || seen[off] {
+			continue
+		}
+		seen[off] = true
+		h := ""
+		if n, err := r.ReadAt(b, off); n == len(b) && (err == nil || errors.Is(err, io.EOF)) {
+			h = fmt.Sprintf("%X", sha256.Sum256(b))
+		}
+		out = append(out, drives.FPBlock{Where: fmt.Sprintf("off:%d", off), SHA256: h})
+	}
+	return out
 }

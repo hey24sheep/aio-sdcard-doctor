@@ -50,7 +50,7 @@ func guiLockDir() string {
 // starts one. Ctrl+C in the console stops it.
 func startGUI(ctx context.Context, io IO, noOpen bool, port int) error {
 	lock := guiLockDir()
-	if url, ok := gui.Reopen(lock); ok && port == 0 {
+	if url, ok := gui.Reopen(lock, isAdmin()); ok && port == 0 {
 		fmt.Fprintf(io.Out, "SD card doctor is already running — reopened at %s\n", url)
 		if !noOpen {
 			if err := openWindow(url); err != nil {
@@ -61,7 +61,7 @@ func startGUI(ctx context.Context, io IO, noOpen bool, port int) error {
 	}
 	s := app.NewSession(ctx, appDeps("gui"))
 	defer s.Close()
-	srv, err := gui.Start(ctx, s, gui.Options{Port: port, LockDir: lock})
+	srv, err := gui.Start(ctx, s, gui.Options{Port: port, LockDir: lock, Admin: isAdmin()})
 	if err != nil {
 		return exit(ExitError, "gui: %v", err)
 	}

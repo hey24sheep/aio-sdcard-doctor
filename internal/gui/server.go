@@ -37,6 +37,7 @@ type Options struct {
 	Port      int           // 0 = any free port
 	IdleAfter time.Duration // stop when no window and no job for this long (default 60 s; < 0 = never)
 	LockDir   string        // per-user folder for gui.lock, so `gui` can reopen a running window ("" = none)
+	Admin     bool          // this server runs as administrator/root (an elevated `gui` never reopens a plain one)
 }
 
 // Server is a running GUI.
@@ -88,14 +89,14 @@ func Start(ctx context.Context, s *app.Session, opt Options) (*Server, error) {
 	mux.HandleFunc("GET /api/dirs", sv.apiDirs)
 	mux.HandleFunc("POST /api/open-dest", sv.apiOpenDest)
 	sv.http = &http.Server{Handler: sv.guard(mux), ReadHeaderTimeout: 10 * time.Second}
+	if opt.LockDir != "" { // before serving: the mint handler reads what this sets
+		sv.writeLock(opt.LockDir, opt.Admin)
+	}
 	go sv.http.Serve(ln)
 	go sv.fanout()
 	idle := opt.IdleAfter
 	if idle == 0 {
 		idle = 60 * time.Second
-	}
-	if opt.LockDir != "" {
-		sv.writeLock(opt.LockDir)
 	}
 	go func() {
 		defer close(sv.done)
@@ -108,7 +109,7 @@ func Start(ctx context.Context, s *app.Session, opt Options) (*Server, error) {
 				sv.http.Close()
 				return
 			case <-t.C:
-				step := s.View().Step // outside sv.mu: requests never wait on the session
+				step := s.Step() // outside sv.mu: requests never wait on the session
 				sv.mu.Lock()
 				stop := idle > 0 && shouldStop(sv.clients, time.Since(sv.lastSeen), step, sv.everSeen, idle)
 				sv.mu.Unlock()
@@ -131,14 +132,14 @@ func shouldStop(clients int, idleFor time.Duration, step app.Step, everSeen bool
 }
 
 // Reopen asks a running GUI of this user (found through gui.lock in dir) for a fresh link.
-func Reopen(dir string) (string, bool) {
+func Reopen(dir string, admin bool) (string, bool) {
 	b, err := os.ReadFile(filepath.Join(dir, "gui.lock"))
 	if err != nil {
 		return "", false
 	}
 	var l lockFile
-	if json.Unmarshal(b, &l) != nil || l.Port == 0 {
-		return "", false
+	if json.Unmarshal(b, &l) != nil || l.Port == 0 || admin && !l.Admin {
+		return "", false // an elevated `gui` starts its own window: reopening a plain one would loop
 	}
 	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/internal/mint", l.Port), nil)
 	req.Header.Set("X-Mint", l.Mint)
@@ -148,8 +149,9 @@ func Reopen(dir string) (string, bool) {
 	}
 	defer resp.Body.Close()
 	var out struct{ URL string }
-	if resp.StatusCode != 200 || json.NewDecoder(resp.Body).Decode(&out) != nil || out.URL == "" {
-		return "", false
+	if resp.StatusCode != 200 || json.NewDecoder(resp.Body).Decode(&out) != nil ||
+		!strings.HasPrefix(out.URL, fmt.Sprintf("http://127.0.0.1:%d/", l.Port)) {
+		return "", false // only ever a link to that server on this computer
 	}
 	return out.URL, true
 }

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
@@ -41,7 +42,34 @@ func (s *folderSink) Has(dest string, size int64) bool {
 	return err == nil && st.Mode().IsRegular() && st.Size() == size
 }
 
-func (s *folderSink) Close() error { return nil }
+// Close removes what a stopped or crashed run left in TmpDir — only our own temp files (named by
+// a hash) — and the folder itself once it is empty.
+func (s *folderSink) Close() error {
+	dir := filepath.Join(s.root, TmpDir)
+	es, err := s.out.ReadDir(dir)
+	if err != nil {
+		return nil // nothing there
+	}
+	for _, e := range es {
+		n := e.Name()
+		if h, ok := strings.CutSuffix(n, ".tmp"); ok && len(h) == 40 && !e.IsDir() && isHex(h) {
+			s.out.Remove(filepath.Join(dir, n))
+		}
+	}
+	if es, err := s.out.ReadDir(dir); err == nil && len(es) == 0 {
+		s.out.Remove(dir)
+	}
+	return nil
+}
+
+func isHex(s string) bool {
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
 
 func removeIfExists(out destfs.FS, p string) error {
 	if err := out.Remove(p); err != nil && !errors.Is(err, fs.ErrNotExist) {

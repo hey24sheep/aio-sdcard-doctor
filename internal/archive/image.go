@@ -29,17 +29,36 @@ const (
 	maxWorkers = 4
 )
 
-func hashPath(p string) (string, error) {
+// HashFile is a file's SHA-256 (uppercase hex); Stop ends it between reads (a 256 GB image takes
+// minutes to read).
+func HashFile(ctx context.Context, p string) (string, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return "", err
 	}
 	defer f.Close()
+	return hashReader(ctx, f)
+}
+
+func hashReader(ctx context.Context, r io.Reader) (string, error) {
 	h := sha256.New()
-	if _, err := io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, ctxReader{ctx, r}); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("%X", h.Sum(nil)), nil
+}
+
+// ctxReader ends a long read when ctx is done.
+type ctxReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c ctxReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return c.r.Read(p)
 }
 
 // CompressImage turns a finished card image into an .xz file: compress (parallel streams),
@@ -47,14 +66,21 @@ func hashPath(p string) (string, error) {
 // raw image unless keep. It reads only the local image, never the card. Returns the image's
 // SHA-256 (uppercase hex).
 func CompressImage(ctx context.Context, out destfs.FS, img, dst string, keep bool, progress func(done, total int64)) (string, error) {
+	return CompressImageSum(ctx, out, img, dst, keep, "", progress)
+}
+
+// CompressImageSum is CompressImage for an image whose SHA-256 is already known (imaging just
+// computed it): the image isn't read a second time to hash it.
+func CompressImageSum(ctx context.Context, out destfs.FS, img, dst string, keep bool, want string, progress func(done, total int64)) (string, error) {
 	st, err := os.Stat(img)
 	if err != nil {
 		return "", err
 	}
 	size := st.Size()
-	want, err := hashPath(img)
-	if err != nil {
-		return "", err
+	if want == "" {
+		if want, err = HashFile(ctx, img); err != nil {
+			return "", err
+		}
 	}
 	tmp := dst + ".tmp"
 	removeIfExists(out, tmp)
@@ -77,7 +103,7 @@ func CompressImage(ctx context.Context, out destfs.FS, img, dst string, keep boo
 	if err := w.Close(); err != nil {
 		return fail(err)
 	}
-	got, err := hashXZ(tmp)
+	got, err := hashXZ(ctx, tmp)
 	if err != nil {
 		return fail(err)
 	}
@@ -95,7 +121,7 @@ func CompressImage(ctx context.Context, out destfs.FS, img, dst string, keep boo
 	return want, nil
 }
 
-func hashXZ(p string) (string, error) {
+func hashXZ(ctx context.Context, p string) (string, error) {
 	f, err := os.Open(p)
 	if err != nil {
 		return "", err
@@ -105,11 +131,7 @@ func hashXZ(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	h := sha256.New()
-	if _, err := io.Copy(h, r); err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%X", h.Sum(nil)), nil
+	return hashReader(ctx, r)
 }
 
 // compressParallel compresses [0,size) of img in segments with up to maxWorkers encoders and

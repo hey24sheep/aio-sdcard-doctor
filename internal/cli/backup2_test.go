@@ -118,3 +118,15 @@ func TestCustomAsksApps(t *testing.T) {
 		t.Fatalf("%d files copied for Telegram only\n%s", ok, errOut)
 	}
 }
+
+// Adversarial pass A7: no answer (EOF, a closed terminal) at "Restart as Administrator/root?"
+// counted as yes. No answer is no.
+func TestNoAnswerAtElevationIsNo(t *testing.T) {
+	oldAdmin := isAdmin
+	defer func() { isAdmin = oldAdmin }()
+	isAdmin = func() bool { return false }
+	code, _, errOut := cli(t, true, "", "rescue", "--from", mockDevice(), "--to", filepath.Join(t.TempDir(), "out"))
+	if code != ExitAdmin || !strings.Contains(errOut, "Not elevated") {
+		t.Fatalf("exit %d:\n%s", code, errOut)
+	}
+}

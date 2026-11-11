@@ -14,7 +14,7 @@ import (
 // M4 review #4: `gui` while a GUI runs gets a fresh link to it (reopening a closed window mid-job).
 func TestReopenMintsFreshLink(t *testing.T) {
 	sv := start(t) // started with a lock dir (see start)
-	url, ok := Reopen(sv.lockDir)
+	url, ok := Reopen(sv.lockDir, false)
 	if !ok || !strings.HasPrefix(url, sv.base+"/?t=") {
 		t.Fatalf("reopen: %q %v", url, ok)
 	}
@@ -33,7 +33,7 @@ func TestReopenMintsFreshLink(t *testing.T) {
 		t.Fatalf("forged mint: %d", resp.StatusCode)
 	}
 	sv.srv.Close()
-	if _, ok := Reopen(sv.lockDir); ok {
+	if _, ok := Reopen(sv.lockDir, false); ok {
 		t.Fatal("reopened a GUI that has stopped")
 	}
 }
@@ -98,3 +98,16 @@ func TestIdleWaitsLongerBeforeFirstWindow(t *testing.T) {
 }
 
 var _ = context.Background
+
+// Adversarial pass U3: "Run as Administrator: aio-sdcard-doctor gui" while the plain window was
+// still alive reopened that same window, back on the "needs administrator" page. An elevated
+// `gui` starts its own server instead.
+func TestElevatedGUIDoesNotReopenPlainOne(t *testing.T) {
+	sv := start(t) // a plain (not elevated) server
+	if _, ok := Reopen(sv.lockDir, true); ok {
+		t.Fatal("an elevated gui reopened the plain window")
+	}
+	if _, ok := Reopen(sv.lockDir, false); !ok {
+		t.Fatal("a plain gui no longer reopens the plain window")
+	}
+}

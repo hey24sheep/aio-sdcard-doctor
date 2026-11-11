@@ -179,3 +179,22 @@ func TestHugeImagePassedWithNote(t *testing.T) {
 		t.Fatalf("ok %v why %q", ok, why)
 	}
 }
+
+// Adversarial pass D6: a video with data after its last box (Insta360 .insv files end with a
+// trailer of their own) was refused as "truncated" or "trailing bytes". A trailer is fine; a box
+// that really runs past the end is still truncation.
+func TestVideoTrailerAllowed(t *testing.T) {
+	mp4 := append(append(ftypBox("isom"), box("moov", box("mvhd", make([]byte, 100)))...), box("mdat", make([]byte, 500))...)
+	trailer := append([]byte{0x00, 0x10, 0x00, 0x00, 0x8d, 0xb4, 0x2d, 0x69}, bytes.Repeat([]byte{0xC3}, 200)...)
+	for name, b := range map[string][]byte{
+		"binary trailer": append(append([]byte{}, mp4...), trailer...),
+		"a few bytes":    append(append([]byte{}, mp4...), 1, 2, 3),
+	} {
+		if ok, why := check(".insv", b); !ok {
+			t.Errorf("%s: %s", name, why)
+		}
+	}
+	if ok, _ := check(".mp4", mp4[:len(mp4)-100]); ok {
+		t.Error("an mp4 cut inside its mdat passed")
+	}
+}

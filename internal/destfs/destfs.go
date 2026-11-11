@@ -12,7 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 )
 
 // File is a file being written.
@@ -48,9 +51,10 @@ var ErrSizeMismatch = errors.New("existing image has a different size than the c
 type owner struct{ uid, gid int }
 
 type guarded struct {
-	dest  string   // canonical destination root
-	srcs  []string // canonical source roots
-	owner *owner   // chown created paths to this user (unix, when elevated — R12)
+	dest  string     // canonical destination root
+	mu    sync.Mutex // guards srcs (Protect adds to it while writing goes on)
+	srcs  []string   // canonical source roots
+	owner *owner     // chown created paths to this user (unix, when elevated — R12)
 }
 
 // New returns an FS that writes only inside destRoot and never inside any sourceRoot.
@@ -62,6 +66,17 @@ func New(destRoot string, sourceRoots ...string) FS {
 		}
 	}
 	return g
+}
+
+// Protect adds a source root f must never write into: the card's new path after it came back
+// under another drive letter or mount point.
+func Protect(f FS, root string) {
+	if g, ok := f.(*guarded); ok && root != "" {
+		c := canonical(root)
+		g.mu.Lock()
+		g.srcs = append(g.srcs, c)
+		g.mu.Unlock()
+	}
 }
 
 // SetOwner makes f chown everything it creates to uid:gid (the GUI's explicit --owner, R12).
@@ -80,19 +95,7 @@ func canonical(p string) string {
 	if err != nil {
 		abs = filepath.Clean(p)
 	}
-	existing, rest := abs, ""
-	for i := 0; i < 4096; i++ { // bounded walk up to the deepest existing ancestor
-		if r, err := filepath.EvalSymlinks(existing); err == nil {
-			abs = filepath.Join(r, rest)
-			break
-		}
-		parent := filepath.Dir(existing)
-		if parent == existing {
-			break
-		}
-		rest = filepath.Join(filepath.Base(existing), rest)
-		existing = parent
-	}
+	abs = drives.RealPath(abs) // symlinks, and on Windows junctions, mount points and subst
 	if caseInsensitive {
 		abs = strings.ToLower(abs)
 	}
@@ -114,7 +117,10 @@ func (g *guarded) check(p string) string {
 		panic(fmt.Sprintf("destfs: write to a device path %q", p))
 	}
 	c := canonical(p)
-	for _, s := range g.srcs {
+	g.mu.Lock()
+	srcs := g.srcs
+	g.mu.Unlock()
+	for _, s := range srcs {
 		if under(c, s) {
 			panic(fmt.Sprintf("destfs: write inside source %q: %q", s, p))
 		}

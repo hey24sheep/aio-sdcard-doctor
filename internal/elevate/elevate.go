@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -21,18 +23,34 @@ func (e *ExitError) Error() string { return fmt.Sprintf("elevated run exited wit
 
 const exeName = "aio-sdcard-doctor"
 
-// Instruction is the exact command a user can run themselves when we can't elevate.
-func Instruction(args []string) string { return instruction(runtime.GOOS, args) }
+// Instruction is the exact command a user can run themselves when we can't elevate. It names
+// this program by its full path: an unpacked download isn't on PATH, so the bare name wouldn't
+// be found (and PowerShell doesn't run a program from the current folder by name).
+func Instruction(args []string) string { return instructionFor(runtime.GOOS, selfPath(), args) }
 
-func instruction(goos string, args []string) string {
+func instruction(goos string, args []string) string { return instructionFor(goos, exeName, args) }
+
+func instructionFor(goos, exe string, args []string) string {
 	if goos == "windows" {
-		return "Run as Administrator: " + strings.TrimSpace(exeName+" "+windowsParams(args))
+		return "Run as Administrator: " + strings.TrimSpace(windowsQuote(exe)+" "+windowsParams(args))
 	}
 	q := make([]string, len(args))
 	for i, a := range args {
 		q[i] = shQuote(a)
 	}
-	return strings.TrimSpace("sudo " + exeName + " " + strings.Join(q, " "))
+	return strings.TrimSpace("sudo " + shQuote(exe) + " " + strings.Join(q, " "))
+}
+
+// selfPath is the running program's full path, or its name when that can't be found.
+func selfPath() string {
+	p, err := os.Executable()
+	if err != nil {
+		return exeName
+	}
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		p = r
+	}
+	return p
 }
 
 var shSafe = regexp.MustCompile(`^[A-Za-z0-9_@%+=:,./-]+$`)

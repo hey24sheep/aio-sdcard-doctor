@@ -48,6 +48,10 @@ func TestFormatSizes(t *testing.T) {
 			// truncated: the structure runs past the end
 			cut := int64(len(data) * 6 / 10)
 			n, complete, err = f.Size(bytes.NewReader(data[:cut]), 0, cut)
+			if f.Stream && complete && n == cut { // the cut fell between frames: a whole, shorter stream
+				cut--
+				n, complete, err = f.Size(bytes.NewReader(data[:cut]), 0, cut)
+			}
 			if err != nil || complete || n > cut {
 				t.Fatalf("truncated: size %d complete=%v err=%v (limit %d)", n, complete, err, cut)
 			}

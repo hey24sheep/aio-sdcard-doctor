@@ -93,7 +93,8 @@ var bmffFormat = Format{HeaderSized: true, Name: "isobmff", Ext: "mp4", Cat: pro
 				return 0, err
 			}
 			typ := string(h[4:8])
-			if !bmffTop[typ] || pos == 0 && typ != "ftyp" {
+			// another ftyp after a whole file is the next file starting (two videos back to back)
+			if !bmffTop[typ] || pos == 0 && typ != "ftyp" || pos > 0 && typ == "ftyp" && ok() {
 				if pos == 0 {
 					return 0, errBad
 				}
@@ -210,9 +211,9 @@ var segmentChildren = map[uint32]bool{0x114D9B74: true, 0x1549A966: true, 0x1654
 	0x1C53BB6B: true, 0x1941A469: true, 0x1043A770: true, 0x1254C367: true, 0xEC: true, 0xBF: true}
 
 // Matroska / WebM: EBML header, then the Segment size (or a walk of its children when unknown).
-var ebmlFormat = Format{HeaderSized: true, Name: "ebml", Ext: "mkv", Cat: profile.Videos, MaxSize: 64 * gib,
+var ebmlFormat = Format{Stream: true, HeaderSized: true, Name: "ebml", Ext: "mkv", Cat: profile.Videos, MaxSize: 64 * gib,
 	Magics: []Magic{{0, []byte{0x1A, 0x45, 0xDF, 0xA3}}},
-	Size: sizer(func(x *rd) (int64, error) {
+	Size: streamSizer(func(x *rd) (int64, error) {
 		hs, n, unk, err := ebmlVint(x, 4)
 		if err != nil {
 			return 0, err
@@ -272,9 +273,9 @@ var ebmlFormat = Format{HeaderSized: true, Name: "ebml", Ext: "mkv", Cat: profil
 	}}
 
 // MPEG-TS / M2TS: a run of 188- or 192-byte packets with sync bytes.
-var tsFormat = Format{Name: "mpegts", Ext: "ts", Cat: profile.Videos, MaxSize: 64 * gib,
+var tsFormat = Format{Stream: true, Name: "mpegts", Ext: "ts", Cat: profile.Videos, MaxSize: 64 * gib,
 	Magics: []Magic{{0, []byte{0x47}}, {4, []byte{0x47}}},
-	Size: sizer(func(x *rd) (int64, error) {
+	Size: streamSizer(func(x *rd) (int64, error) {
 		h, err := x.bytes(0, 4+192*2+1)
 		if err != nil {
 			return 0, err
@@ -303,6 +304,7 @@ var tsFormat = Format{Name: "mpegts", Ext: "ts", Cat: profile.Videos, MaxSize: 6
 					}
 				}
 				x.seen = x.limit
+				x.atEnd = x.limit == pos && packets >= 16 // whole packets to the very end: complete
 				return 0, errTrunc
 			}
 			b, err := x.bytes(pos, int(n*stride))
@@ -330,8 +332,8 @@ var tsFormat = Format{Name: "mpegts", Ext: "ts", Cat: profile.Videos, MaxSize: 6
 	}}
 
 // MPEG-PS (MPG, VOB, MOD, TOD): pack headers and PES packets to the end code 000001B9.
-var psFormat = Format{Name: "mpegps", Ext: "mpg", Cat: profile.Videos, MaxSize: 64 * gib,
-	Magics: []Magic{{0, []byte{0, 0, 1, 0xBA}}}, Size: sizer(func(x *rd) (int64, error) {
+var psFormat = Format{Stream: true, Name: "mpegps", Ext: "mpg", Cat: profile.Videos, MaxSize: 64 * gib,
+	Magics: []Magic{{0, []byte{0, 0, 1, 0xBA}}}, Size: streamSizer(func(x *rd) (int64, error) {
 		pos, packs := int64(0), 0
 		for {
 			if err := x.step(); err != nil {
@@ -380,8 +382,8 @@ var psFormat = Format{Name: "mpegps", Ext: "mpg", Cat: profile.Videos, MaxSize: 
 	})}
 
 // FLV: tag sizes, each confirmed by the following PreviousTagSize.
-var flvFormat = Format{Name: "flv", Ext: "flv", Cat: profile.Videos, MaxSize: 16 * gib,
-	Magics: []Magic{m(0, "FLV\x01")}, Size: sizer(func(x *rd) (int64, error) {
+var flvFormat = Format{Stream: true, Name: "flv", Ext: "flv", Cat: profile.Videos, MaxSize: 16 * gib,
+	Magics: []Magic{m(0, "FLV\x01")}, Size: streamSizer(func(x *rd) (int64, error) {
 		h, err := x.bytes(0, 9)
 		if err != nil {
 			return 0, err

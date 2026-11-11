@@ -144,6 +144,17 @@ func capOf(name string, ok bool, why string) job.Capability {
 
 // Available says which operations work for this card on this OS, each with its reason when not.
 // Order: Check, Repair, Format, Health test.
+// FormatElsewhere says where to format a card that has no partition (after a health test).
+func FormatElsewhere(goos string) string {
+	switch goos {
+	case "windows":
+		return "format it in Disk Management (right-click the card, New Simple Volume)"
+	case "darwin":
+		return "format it in Disk Utility (Erase, MS-DOS (FAT) or ExFAT)"
+	}
+	return "format it with GParted, or create a partition and run mkfs.exfat"
+}
+
 func Available(goos string, t Target, fsKind string) []job.Capability {
 	fam := family(fsKind)
 	if fsKind == "" {
@@ -188,6 +199,13 @@ func Available(goos string, t Target, fsKind string) []job.Capability {
 	}
 	health, hwhy := true, ""
 	repair, rwhy := check, why
+	// a card left without a partition (after a health test) has no volume: nothing this tool can
+	// check, repair or format until the OS's own disk tool makes one
+	if t.Vol.Root == "" && t.Vol.Device == "" {
+		const none = "the card has no partition (as a health test leaves it)"
+		check, why, repair, rwhy = false, none, false, none
+		format, fwhy = false, none+" — "+FormatElsewhere(goos)
+	}
 	if t.Disk.ReadOnly || t.Vol.WriteProtected {
 		const lock = "card is write-protected — slide the lock switch"
 		repair, rwhy, format, fwhy, health, hwhy = false, lock, false, lock, false, lock

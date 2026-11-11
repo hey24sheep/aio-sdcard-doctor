@@ -2,6 +2,7 @@ package verify
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"go.uber.org/goleak"
 
@@ -274,5 +276,22 @@ func TestVerifyReportsElsewhere(t *testing.T) {
 	}
 	if m, _ := filepath.Glob(filepath.Join(root, "Reports", "verify*")); len(m) != 0 {
 		t.Fatalf("wrote next to the manifest anyway: %v", m)
+	}
+}
+
+// Adversarial pass C7: verify --image card.img.xz hashed the raw card.img whenever it was still
+// there (--keep-raw), so the .xz asked about was never read.
+func TestVerifyImageReadsTheNamedXZ(t *testing.T) {
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("card"), 4096)
+	raw := filepath.Join(dir, "card.img")
+	os.WriteFile(raw, data, 0o644)
+	sum := sha256.Sum256(data)
+	os.WriteFile(raw+".json", []byte(fmt.Sprintf(`{"SHA256":"%X","Size":%d}`, sum, len(data))), 0o644)
+	os.WriteFile(raw+".xz", []byte("not an xz at all"), 0o644) // a broken .xz next to a good raw image
+	v := &Verify{Image: raw + ".xz", Now: time.Now}
+	res, _ := v.Run(context.Background(), job.Env{}, job.Plan{})
+	if res.Counters["OK"] == 1 {
+		t.Fatal("the broken .xz passed: the raw image was checked instead")
 	}
 }

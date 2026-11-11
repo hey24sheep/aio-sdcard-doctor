@@ -106,6 +106,12 @@ type Recover struct {
 func (r *Recover) Name() string { return "recover" }
 
 func (r *Recover) defaults() {
+	for _, s := range r.Select { // a pick from a deep-scan list needs the deep scan's results
+		if strings.HasPrefix(s, "C:") {
+			r.Deep = true
+			break
+		}
+	}
 	if r.OpenSource == nil {
 		r.OpenSource = func(s worker.Spec, stall time.Duration) (Source, error) { return worker.Spawn(s, stall) }
 	}
@@ -210,7 +216,7 @@ func (r *Recover) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 			p.Issues = append(p.Issues, job.Issue{Kind: "busy", Severity: job.Block, Title: job.ErrBusy.Error(),
 				Choices: []job.Choice{job.Stop}, Default: job.Stop})
 		case err == nil:
-			if m, err := manifest.Open(st); err == nil && (m.Volume.FSSerial != "" || m.Volume.Model != "") {
+			if m, err := manifest.Open(st); err == nil && (m.Volume.FSSerial != "" || m.Volume.Model != "" || len(m.Volume.Fingerprint) > 0) {
 				if ok, _, _ := m.Volume.Matches(r.src.Identity()); !ok {
 					p.Issues = append(p.Issues, job.Issue{Kind: "dest-other-card", Severity: job.Block,
 						Title: "This folder holds a recovery of a different card", Detail: "Choose a new folder.",
@@ -677,6 +683,7 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 	for _, s := range r.Select {
 		sel[s] = true
 	}
+	matched := map[string]bool{} // picks found among this card's results
 	rescued := r.rescuedSums()
 	seen := map[string]string{} // SHA-256 → the entry that holds it
 	m.Each(func(e manifest.Entry) error {
@@ -717,6 +724,12 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 			res.Counters[string(manifest.ALREADY_COPIED)]++
 			continue
 		}
+		if sel[rw.ID] {
+			matched[rw.ID] = true
+		}
+		if sel[rw.Path] {
+			matched[rw.Path] = true
+		}
 		if rw.State == Unrecoverable {
 			e.Status, e.Error = damaged, rw.Comment
 		} else if why := r.why(rw, sel); why != "" {
@@ -732,6 +745,10 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 			}
 			if err != nil {
 				sink.Close()
+				if ctx.Err() != nil { // stopped mid-file: the files so far still get their reports
+					r.writeReports(out, m, stamp, &res)
+					return res, ctx.Err()
+				}
 				return res, fmt.Errorf("writing to the destination: %w", err)
 			}
 			if e.Status == damaged {
@@ -750,11 +767,17 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 	if zs, ok := sink.(interface{ Failed() []string }); ok && len(zs.Failed()) > 0 {
 		res.Clean = false
 	}
-	csvPath := report.UniquePath(filepath.Join(r.reportsDir(), "recover_"+stamp+".csv"))
-	if err := report.WriteCSV(out, csvPath, m.Each); err == nil {
-		res.Reports = append(res.Reports, csvPath)
+	if missing := len(sel) - len(matched); len(sel) > 0 && missing > 0 && ctx.Err() == nil {
+		msg := fmt.Sprintf("%d of the %d picked files are not in this card's results", missing, len(sel))
+		if len(matched) == 0 {
+			return res, errors.New(msg + " — was the list made from another card, or with other options (--thorough, a volume)?")
+		}
+		res.Clean = false
+		if env.Log != nil {
+			env.Log("warn", msg)
+		}
 	}
-	m.ExportJSON(out, filepath.Join(r.reportsDir(), "recover_manifest.json"))
+	r.writeReports(out, m, stamp, &res)
 	if ctx.Err() != nil {
 		return res, ctx.Err()
 	}
@@ -767,8 +790,8 @@ func (r *Recover) stillStored(st *job.Store, old manifest.Entry) bool {
 	if old.Dest == "" {
 		return false
 	}
-	if strings.Contains(old.Dest, ".zip/") {
-		return archive.ZipIndexHas(st, old.Dest, old.Bytes)
+	if _, _, ok := archive.ZipPart(old.Dest); ok {
+		return archive.ZipParts{}.Stored(st, r.Dest, old.Dest, old.Bytes)
 	}
 	fi, err := os.Stat(filepath.Join(r.Dest, filepath.FromSlash(old.Dest)))
 	return err == nil && fi.Size() == old.Bytes
@@ -820,6 +843,15 @@ func (r *Recover) extract(ctx context.Context, rw Row, dest, key string, dev io.
 	return good, why, stored, sum, nil // why: a note on a file that passed (validate.NotDecoded)
 }
 
+// writeReports writes the recover CSV and manifest.json for every row so far.
+func (r *Recover) writeReports(out destfs.FS, m *manifest.Manifest, stamp string, res *job.Result) {
+	csvPath := report.UniquePath(filepath.Join(r.reportsDir(), "recover_"+stamp+".csv"))
+	if err := report.WriteCSV(out, csvPath, m.Each); err == nil {
+		res.Reports = append(res.Reports, csvPath)
+	}
+	m.ExportJSON(out, filepath.Join(r.reportsDir(), "recover_manifest.json"))
+}
+
 // writeList writes the results list as a CSV.
 func (r *Recover) writeList(out destfs.FS, stamp string) (string, error) {
 	var b strings.Builder
@@ -831,7 +863,7 @@ func (r *Recover) writeList(out destfs.FS, stamp string) (string, error) {
 		if !rw.MTime.IsZero() {
 			mt = rw.MTime.Format("2006-01-02 15:04:05")
 		}
-		w.Write([]string{rw.State, rw.Name, rw.Path, strconv.FormatInt(rw.Size, 10), mt, rw.Comment, rw.ID})
+		w.Write([]string{rw.State, report.Cell(rw.Name), report.Cell(rw.Path), strconv.FormatInt(rw.Size, 10), mt, report.Cell(rw.Comment), rw.ID})
 	}
 	w.Flush()
 	p := report.UniquePath(filepath.Join(r.reportsDir(), "recover_list_"+stamp+".csv"))
@@ -846,6 +878,11 @@ func ReadSelection(p string) ([]string, error) {
 	}
 	s := strings.TrimPrefix(string(b), "\xef\xbb\xbf")
 	recs, err := csv.NewReader(strings.NewReader(s)).ReadAll()
+	if err != nil || len(recs) == 0 || len(recs[0]) < 7 || recs[0][0] != "State" {
+		semi := csv.NewReader(strings.NewReader(s)) // Excel in many countries saves with ";"
+		semi.Comma = ';'
+		recs, err = semi.ReadAll()
+	}
 	if err != nil || len(recs) == 0 || len(recs[0]) < 7 || recs[0][0] != "State" {
 		var out []string
 		for _, l := range strings.Split(s, "\n") {
