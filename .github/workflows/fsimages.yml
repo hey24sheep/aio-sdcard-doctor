@@ -13,8 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
       - name: build file-system images with the real mkfs tools (dev-only, never shipped)
@@ -24,7 +24,7 @@ jobs:
       - run: AIO_FSIMAGES="$RUNNER_TEMP/fsimages" go test -count=1 -run TestRealFSImages ./internal/fsread
       - name: keep the images (copy into internal/fsread/testdata/realfs)
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fsimages
           path: ${{ runner.temp }}/fsimages/*.img.gz
