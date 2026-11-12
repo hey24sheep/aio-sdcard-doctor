@@ -1,4 +1,4 @@
-<h1 align="center">aio-sdcard-doctor</h1>
+<h1 align="center">AIO SDCard Doctor</h1>
 
 <p align="center"><strong>Get your photos off a failing SD card, safely.</strong><br>
 Copy, image, verify, undelete and repair, from a window, a terminal UI or plain commands.<br>
