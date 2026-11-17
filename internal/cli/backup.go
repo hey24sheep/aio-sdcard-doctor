@@ -166,7 +166,7 @@ func otherSummary(inv scan.Inventory) string {
 		top = top[:5]
 	}
 	return fmt.Sprintf("Unknown file types: %s files (%s), e.g. %s — only Full or Custom copies them.",
-		preflight.Commas(n), preflight.GB(bytes), strings.Join(top, " "))
+		preflight.Commas(n), preflight.GB(bytes), cleanText(strings.Join(top, " "))) // extensions come from the card
 }
 
 // chooseBackup asks what to copy, showing what each choice would take from this card. prev is
@@ -185,7 +185,8 @@ func chooseBackup(ctx context.Context, io IO, inv scan.Inventory, r *rescue.Resc
 		}
 	}
 	choices := menuChoices()
-	fmt.Fprintln(io.Err, "\nWhat should be copied?")
+	st := styleOf(io)
+	fmt.Fprintln(io.Err, "\n"+st.head("What should be copied?"))
 	for i, m := range choices {
 		count := ""
 		if m.preset != nil {
@@ -196,7 +197,8 @@ func chooseBackup(ctx context.Context, io IO, inv scan.Inventory, r *rescue.Resc
 		if i+1 == defaultChoice {
 			mark = " (default)"
 		}
-		fmt.Fprintf(io.Err, "  %2d) %-15s %-27s %s%s\n", i+1, m.title, count, m.desc, mark)
+		fmt.Fprintf(io.Err, "  %s %s %s %s%s\n", st.paint("signal", true, fmt.Sprintf("%2d)", i+1)), st.head(fmt.Sprintf("%-15s", m.title)),
+			fmt.Sprintf("%-27s", count), st.dim(m.desc), st.paint("signal", false, mark))
 	}
 	if o := otherSummary(inv); o != "" {
 		fmt.Fprintln(io.Err, "  "+o)

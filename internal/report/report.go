@@ -92,6 +92,7 @@ type Summary struct {
 	Took                           time.Duration
 	Profiles                       []string
 	Excluded                       map[string]int // suggestion id → files the user chose to exclude
+	Kept                           int            // files outside this choice kept as an earlier run left them
 	Issues                         []string
 
 	counts        map[manifest.Status]int
@@ -105,7 +106,16 @@ func (s *Summary) Remove(e manifest.Entry) {
 	if s.counts[e.Status] > 0 {
 		s.counts[e.Status]--
 	}
+	line := headerLine(e)
+	for i, h := range s.headers {
+		if h == line {
+			s.headers = append(s.headers[:i], s.headers[i+1:]...)
+			break
+		}
+	}
 }
+
+func headerLine(e manifest.Entry) string { return fmt.Sprintf("  [%s] %s", e.Header, e.Source) }
 
 func (s *Summary) Add(e manifest.Entry) {
 	if s.counts == nil {
@@ -115,7 +125,7 @@ func (s *Summary) Add(e manifest.Entry) {
 	switch e.Header {
 	case "zeroed", "mismatch", "empty":
 		if len(s.headers) < 80 {
-			s.headers = append(s.headers, fmt.Sprintf("  [%s] %s", e.Header, e.Source))
+			s.headers = append(s.headers, headerLine(e))
 		}
 	}
 	if e.Status == manifest.DELETED_UNRECOVERABLE {
@@ -158,6 +168,9 @@ func (s *Summary) String() string {
 		for _, id := range ids {
 			fmt.Fprintf(&b, "  %-22s %8d\n", id, s.Excluded[id])
 		}
+	}
+	if s.Kept > 0 {
+		fmt.Fprintf(&b, "\nKept from an earlier run (outside this choice, left as they are): %d\n", s.Kept)
 	}
 	if len(s.Issues) > 0 {
 		b.WriteString("\nIssues raised during the run:\n")

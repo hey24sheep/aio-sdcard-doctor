@@ -196,3 +196,25 @@ func TestPreflightLeavesNothingBehind(t *testing.T) {
 		t.Fatal("pre-flight created the destination")
 	}
 }
+
+// "1 files" read wrong in the plan and reports.
+func TestFilesAndFoldersCountReadsRight(t *testing.T) {
+	for n, want := range map[int]string{0: "0 files", 1: "1 file", 2: "2 files", 9624: "9,624 files"} {
+		if got := Files(n); got != want {
+			t.Errorf("Files(%d) = %q, want %q", n, got, want)
+		}
+	}
+	if Folders(1) != "1 folder" || Folders(3) != "3 folders" {
+		t.Errorf("Folders: %q %q", Folders(1), Folders(3))
+	}
+}
+
+// SU1: a pasted destination with its quotes made the write probe panic (the write guard); it is
+// a plain "can't write" block instead.
+func TestPreflightQuotedDestinationIsBlockNotPanic(t *testing.T) {
+	in := base(t)
+	in.DstPath = `"` + filepath.Join(in.DstPath, "dq") + `"`
+	if is := expect(t, in, "dest-not-writable", job.Block); !strings.Contains(is.Detail, "quotes") {
+		t.Fatalf("detail %q", is.Detail)
+	}
+}

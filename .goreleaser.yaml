@@ -31,11 +31,14 @@ archives:
     format_overrides:
       - goos: windows
         formats: [zip]
-    files: [LICENSE, README.md, THIRD_PARTY_NOTICES.txt]
+    files: [LICENSE, README.md, THIRD_PARTY_NOTICES.txt, docs/images/*] # the README's pictures
     wrap_in_directory: true # unpacks into its own folder, not loose into the current one
 
 checksum:
   name_template: checksums.txt
+
+sboms: # an SPDX list of everything inside each archive (syft), next to it in the release
+  - artifacts: archive
 
 nfpms:
   - ids: [cli]

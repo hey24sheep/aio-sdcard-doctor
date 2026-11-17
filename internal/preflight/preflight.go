@@ -74,6 +74,19 @@ func Commas(n int) string {
 	return s
 }
 
+// Files is "1 file", "9,624 files".
+func Files(n int) string { return count(n, "file") }
+
+// Folders is "1 folder", "3 folders".
+func Folders(n int) string { return count(n, "folder") }
+
+func count(n int, one string) string {
+	if n == 1 {
+		return "1 " + one
+	}
+	return Commas(n) + " " + one + "s"
+}
+
 // IsFAT reports whether a file-system name is FAT as Windows, Linux ("vfat") or macOS ("msdos")
 // names it.
 func IsFAT(fsName string) bool {
@@ -119,6 +132,9 @@ func Ours(dir string) bool {
 
 // writable probes the destination by creating and removing Reports/.probe.
 func writable(dir string) error {
+	if err := destfs.CheckRoot(dir); err != nil {
+		return err // the write guard below would panic on it
+	}
 	// Folders the probe has to create are removed again, so a cancelled run leaves nothing.
 	base := filepath.Clean(dir)
 	var made []string
@@ -243,7 +259,7 @@ func Check(in Input) []job.Issue {
 	if len(in.Suggested) > 0 {
 		var parts []string
 		for id, g := range in.Suggested {
-			parts = append(parts, fmt.Sprintf("%s: %d files (%s)", id, g.Files, GB(g.Bytes)))
+			parts = append(parts, fmt.Sprintf("%s: %s (%s)", id, Files(g.Files), GB(g.Bytes)))
 		}
 		sort.Strings(parts)
 		is = append(is, job.Issue{Kind: "suggestions", Title: "Some files could be skipped — you decide",

@@ -14,10 +14,11 @@ import (
 
 const (
 	chunk      = 1 << 20
-	sector     = 4 << 10
+	sector     = 4 << 10 // the trim, scrape and retry read size
+	hardSector = 512     // the edges of bad areas are read this finely
 	minSkip    = 64 << 10
 	maxSkipCap = 64 << 20
-	fpEvery    = 64 << 20 // a fingerprint sample every 64 MiB (first 1 MiB of each)
+	fpEvery    = 64 << 20 // a fingerprint sample at least every 64 MiB (1 MiB each)
 	maxFP      = 8
 )
 
@@ -38,6 +39,7 @@ type imgRun struct {
 	failing    int    // failed reads since the last success
 	destSerial string // the image folder's volume serial when the run started ("" if unknown)
 	thr        job.Throttle
+	unverified bool // the user chose to go on with a card nothing could be compared against
 }
 
 // presenceAfterFailures: this many failed reads in a row check the card is there despite the throttle.
@@ -76,7 +78,8 @@ func (x *imgRun) read(pos int64, n int) (int, error) {
 		if x.dev.Reopen(path) != nil {
 			return got, err
 		}
-		if ok, _ := x.fingerprintMatches(); !ok {
+		// nothing to compare is no evidence of another card: it never left this path
+		if same, known := x.fingerprintMatches(); known && !same {
 			return 0, errDifferentCard
 		}
 		if got2, err2 := x.dev.ReadAt(b, pos); err2 == nil || got2 == n {
@@ -101,8 +104,8 @@ func (x *imgRun) read(pos int64, n int) (int, error) {
 		return 0, err
 	}
 	// The device that came back must be the same card before one more sector is written (C1).
-	if ok, _ := x.fingerprintMatches(); !ok {
-		return 0, errDifferentCard
+	if err := x.sameCard(); err != nil {
+		return 0, err
 	}
 	// back under another path: make sure the image's folder didn't move with it (a hub reset can
 	// bring the card and the destination disk back with their letters swapped)
@@ -134,13 +137,17 @@ func (x *imgRun) good(pos int64, n int) error {
 		return err
 	}
 	x.m.Set(pos, int64(n), Finished)
-	if pos%fpEvery == 0 && n == min(chunk, int(x.size-pos)) && len(x.meta.Fingerprint) < maxFP {
-		have := false
+	// a sample from the first whole chunks read, then one at least every fpEvery: wherever they
+	// fall (after a bad area the chunks are no longer on round offsets)
+	if n == min(chunk, int(x.size-pos)) && len(x.meta.Fingerprint) < maxFP {
+		have, last := false, int64(-1)
 		where := fmt.Sprintf("off:%d", pos)
 		for _, f := range x.meta.Fingerprint {
-			have = have || f.Where == where
+			var off int64
+			fmt.Sscanf(f.Where, "off:%d", &off)
+			have, last = have || f.Where == where, max(last, off)
 		}
-		if !have {
+		if !have && (len(x.meta.Fingerprint) < 3 || pos >= last+fpEvery) {
 			x.meta.Fingerprint = append(x.meta.Fingerprint, drives.FPBlock{Where: where, SHA256: fmt.Sprintf("%X", sha256.Sum256(x.buf[:n]))})
 		}
 	}
@@ -255,8 +262,8 @@ func (x *imgRun) copyPass(skip bool) error {
 	}
 }
 
-func (x *imgRun) sectorAt(pos int64) (bool, error) {
-	n := int(min(int64(sector), x.size-pos))
+// sectorAt reads [pos, pos+n) (n ≤ sector, inside one area of the map).
+func (x *imgRun) sectorAt(pos int64, n int) (bool, error) {
 	got, err := x.read(pos, n)
 	if x.ctx.Err() != nil {
 		return false, x.ctx.Err()
@@ -284,18 +291,19 @@ func (x *imgRun) trimPass() error {
 		}
 		lo, hi := b.Pos, b.Pos+b.Size
 		for lo < hi {
-			ok, err := x.sectorAt(lo)
+			n := min(int64(sector), hi-lo)
+			ok, err := x.sectorAt(lo, int(n))
 			if err != nil {
 				return err
 			}
-			lo += min(int64(sector), hi-lo)
+			lo += n
 			if !ok {
 				break
 			}
 		}
 		for hi > lo {
 			start := max(lo, hi-sector)
-			ok, err := x.sectorAt(start)
+			ok, err := x.sectorAt(start, int(hi-start))
 			if err != nil {
 				return err
 			}
@@ -314,7 +322,7 @@ func (x *imgRun) trimPass() error {
 	}
 }
 
-// scrapePass reads every non-scraped sector once.
+// scrapePass reads every non-scraped sector once, then the edges of the bad areas finely.
 func (x *imgRun) scrapePass() error {
 	for {
 		if err := x.ctx.Err(); err != nil {
@@ -322,9 +330,9 @@ func (x *imgRun) scrapePass() error {
 		}
 		b, ok := x.m.next(NonScraped, 0)
 		if !ok {
-			return nil
+			return x.edges()
 		}
-		if _, err := x.sectorAt(b.Pos); err != nil {
+		if _, err := x.sectorAt(b.Pos, int(min(int64(sector), b.Size))); err != nil {
 			return err
 		}
 		x.m.CurPos = b.Pos
@@ -348,7 +356,7 @@ func (x *imgRun) retryPass() error {
 				if err := x.ctx.Err(); err != nil {
 					return err
 				}
-				if _, err := x.sectorAt(pos); err != nil {
+				if _, err := x.sectorAt(pos, int(min(int64(sector), b.Pos+b.Size-pos))); err != nil {
 					return err
 				}
 			}
@@ -356,13 +364,100 @@ func (x *imgRun) retryPass() error {
 				return err
 			}
 		}
+		if err := x.edges(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
 
+// edges reads every bad area that borders data that read again from that side inward, one
+// 512-byte sector at a time, until the first sector that fails (as ddrescue trims): one bad
+// sector then costs only itself, not the seven readable ones read with it. A dead area still
+// costs one more read per edge, not one per sector.
+func (x *imgRun) edges() error {
+	var bad []Block
+	for _, b := range x.m.Blocks {
+		if b.Status == BadSector {
+			bad = append(bad, b)
+		}
+	}
+	for _, b := range bad {
+		end := b.Pos + b.Size
+		if x.m.statusAt(b.Pos-1) == Finished {
+			for pos := b.Pos; pos < min(end, b.Pos+sector); pos += hardSector {
+				if ok, err := x.fine(pos, int(min(int64(hardSector), end-pos))); err != nil || !ok {
+					if err != nil {
+						return err
+					}
+					break
+				}
+			}
+		}
+		if x.m.statusAt(end) == Finished {
+			for pos := end; pos > max(b.Pos, end-sector); {
+				start := max(b.Pos, pos-hardSector, (pos-1)/hardSector*hardSector)
+				if ok, err := x.fine(start, int(pos-start)); err != nil || !ok {
+					if err != nil {
+						return err
+					}
+					break
+				}
+				pos = start
+			}
+		}
+		if err := x.checkpoint(false); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fine reads one bad sector again; false when it still fails (or was already read). It reads
+// the device directly: a failure changes nothing in the map, so it needn't check the card is
+// still there (that would re-list every disk once per 64 known-bad sectors).
+func (x *imgRun) fine(pos int64, n int) (bool, error) {
+	if err := x.ctx.Err(); err != nil {
+		return false, err
+	}
+	if x.m.statusAt(pos) != BadSector {
+		return false, nil
+	}
+	got, _ := x.dev.ReadAt(x.buf[:n], pos)
+	if x.ctx.Err() != nil {
+		return false, x.ctx.Err()
+	}
+	if got == n {
+		return true, x.good(pos, n)
+	}
+	return false, nil
+}
+
+// sameCard checks the device is the card the image was started on: errDifferentCard when the
+// evidence says another; when there is nothing to compare, it asks whether to go on (once).
+func (x *imgRun) sameCard() error {
+	same, known := x.fingerprintMatches()
+	switch {
+	case known && !same:
+		return errDifferentCard
+	case known || x.unverified:
+		return nil
+	}
+	c := x.ask(job.Issue{Kind: "card-unverified", Severity: job.Warn,
+		Title:   "This card can't be checked against the one the image was started on",
+		Detail:  "None of the parts read before can be read now to compare, and the card has no file-system serial. Continue only if it is the same card: another card's data would be mixed into the image.",
+		Choices: []job.Choice{job.Continue, job.Stop}, Default: job.Stop})
+	if c != job.Continue {
+		return errUnverified
+	}
+	x.unverified = true
+	return nil
+}
+
 // fingerprintMatches re-reads the recorded samples from the device (R2). Unreadable samples are
-// skipped; at least 3 (or all, if fewer) must match and none may differ.
-func (x *imgRun) fingerprintMatches() (bool, error) {
+// skipped; at least 3 (or all, if fewer) must match and none may differ. known is false when
+// nothing could be compared (no sample read, and no file-system serial on both).
+func (x *imgRun) fingerprintMatches() (same, known bool) {
 	var now []drives.FPBlock
 	for _, f := range x.meta.Fingerprint {
 		var off int64
@@ -379,7 +474,11 @@ func (x *imgRun) fingerprintMatches() (bool, error) {
 	if ok && compared == 0 && x.m.Bytes(Finished) > 0 {
 		// Nothing could be compared: only the file-system serial can still vouch for the card.
 		now := drives.NormalizeSerial(x.dev.Identity().FSSerial) // the device as it is now, not as first seen
-		ok = now != "" && drives.NormalizeSerial(x.meta.FSSerial) == now
+		was := drives.NormalizeSerial(x.meta.FSSerial)
+		if now == "" || was == "" {
+			return false, false
+		}
+		return now == was, true
 	}
-	return ok, nil
+	return ok, true
 }

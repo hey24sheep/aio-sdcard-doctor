@@ -73,10 +73,11 @@ type Client struct {
 	exhausted bool
 	gen       int
 	open      OpenReply
-	first     drives.Identity // the card first opened; every later open must be the same card
+	first     OpenReply // the card first opened; every later open must be the same card
 	opened    bool
 	stderr    string
 	closed    bool
+	ctx       context.Context // the run's: Stop ends any call (SetContext); nil = none
 }
 
 // Spawn starts a worker and opens spec. stall is the per-call deadline (directory listings 2×).
@@ -84,19 +85,30 @@ func Spawn(spec Spec, stall time.Duration) (*Client, error) {
 	c := &Client{spec: spec, stall: stall}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if err := c.start(); err != nil {
+	if err := c.start(context.Background()); err != nil {
 		c.closeLocked()
 		return nil, err
 	}
 	return c, nil
 }
 
-// start launches a worker and re-opens the spec. Caller holds mu.
-func (c *Client) start() error {
+// SetContext makes every later call — reads through file and device handles, Validate, and the
+// re-open after a respawn — end when ctx is done (Stop), not only the listings (OA12, SA-9).
+func (c *Client) SetContext(ctx context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.ctx = ctx
+}
+
+// start launches a worker and re-opens the spec; Stop (ctx) ends the wait for a worker killed
+// before and the open. Caller holds mu.
+func (c *Client) start(ctx context.Context) error {
 	if c.lastReap != nil {
 		select {
 		case <-c.lastReap:
 		case <-time.After(reapWait):
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
 	p, err := startProc()
@@ -104,16 +116,21 @@ func (c *Client) start() error {
 		return err
 	}
 	c.p = p
-	c.gen++
 	var r OpenReply
 	// a process start can take seconds on a busy machine; that is not a stalled card
-	if err := c.callLocked("W.Open", c.spec, &r, max(2*c.stall, 10*time.Second)); err != nil {
+	if err := c.callLocked(ctx, "W.Open", c.spec, &r, max(2*c.stall, 10*time.Second)); err != nil {
+		// A worker whose open failed holds nothing usable (or half of another card): drop it, so
+		// the next call opens again once the card is back and checks it is the same card.
+		if c.p != nil {
+			c.lastReap = c.p.kill()
+			c.p = nil
+		}
 		return err
 	}
 	// After a re-plug or a restart the reader must be looking at the same card (same file-system
 	// serial, or the same size and content samples when there is none); a stranger is never read.
 	if c.opened {
-		if ok, _, _ := c.first.Matches(r.ID); !ok { // serials, else size and content samples
+		if ok, _, _ := withSamples(c.first).Matches(withSamples(r)); !ok { // serials, else size and content samples
 			if c.p != nil {
 				c.lastReap = c.p.kill()
 				c.p = nil
@@ -121,10 +138,21 @@ func (c *Client) start() error {
 			return source.ErrDifferentCard
 		}
 	} else {
-		c.first, c.opened = r.ID, true
+		c.first, c.opened = r, true
 	}
 	c.open = r
+	c.gen++ // only now are old handles stale: they re-open against the checked card
 	return nil
+}
+
+// withSamples is an open's identity with its raw content samples, for telling the same card
+// from a stranger after a respawn (a manifest records the identity alone).
+func withSamples(r OpenReply) drives.Identity {
+	id := r.ID
+	if len(r.Samples) > 0 {
+		id.Fingerprint = r.Samples
+	}
+	return id
 }
 
 // fail kills the current worker after a stall or crash and charges the budget.
@@ -141,25 +169,45 @@ func (c *Client) fail(kind error) error {
 	return kind
 }
 
-// call runs one RPC with a deadline, (re)spawning the worker first if needed.
+// call runs one RPC with a deadline, (re)spawning the worker first if needed; it ends on Stop
+// when the run's context was set.
 func (c *Client) call(method string, args, reply any, timeout time.Duration) error {
+	return c.callCtx(runCtx, method, args, reply, timeout)
+}
+
+// runCtx asks callCtx for the run's context (set by SetContext), read under the lock.
+var runCtx = context.WithValue(context.Background(), runCtxKey{}, true)
+
+type runCtxKey struct{}
+
+// callCtx is call that also returns when ctx is cancelled (Stop); runCtx means the run's context.
+func (c *Client) callCtx(ctx context.Context, method string, args, reply any, timeout time.Duration) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if ctx == runCtx {
+		ctx = c.ctx
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if c.closed {
 		return errors.New("worker: client closed")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if c.p == nil {
 		if c.exhausted {
 			return source.ErrTooManyRestarts
 		}
-		if err := c.start(); err != nil {
+		if err := c.start(ctx); err != nil {
 			return err
 		}
 	}
-	return c.callLocked(method, args, reply, timeout)
+	return c.callLocked(ctx, method, args, reply, timeout)
 }
 
-func (c *Client) callLocked(method string, args, reply any, timeout time.Duration) error {
+func (c *Client) callLocked(ctx context.Context, method string, args, reply any, timeout time.Duration) error {
 	call := c.p.rpc.Go(method, args, reply, make(chan *rpc.Call, 1))
 	t := time.NewTimer(timeout)
 	defer t.Stop()
@@ -177,6 +225,13 @@ func (c *Client) callLocked(method string, args, reply any, timeout time.Duratio
 		return c.fail(source.ErrWorkerCrashed)
 	case <-t.C:
 		return c.fail(source.ErrStalled)
+	case <-ctx.Done():
+		// Stop: the worker may be deep in a long listing; it goes (not a failure, no budget
+		// charged) and the next call starts a fresh one
+		c.stderr = c.p.stderr.String()
+		c.lastReap = c.p.kill()
+		c.p = nil
+		return ctx.Err()
 	}
 }
 
@@ -207,7 +262,11 @@ func (c *Client) Retarget(spec Spec) error {
 		c.lastReap = c.p.kill()
 		c.p = nil
 	}
-	return c.start()
+	ctx := c.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return c.start(ctx)
 }
 
 // ResetBudget forgets past failures (the user chose "keep trying").
@@ -268,13 +327,16 @@ func (c *Client) ReadError() string         { return c.open.ReadErr }
 
 // ReadDir implements fs.ReadDirFS.
 func (c *Client) ReadDir(name string) ([]fs.DirEntry, error) {
-	var es []DirEnt
-	if err := c.call("W.ReadDir", name, &es, 2*c.stall); err != nil {
+	var r DirReply
+	if err := c.call("W.ReadDir", name, &r, 2*c.stall); err != nil {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
 	}
-	out := make([]fs.DirEntry, len(es))
-	for i, e := range es {
+	out := make([]fs.DirEntry, len(r.Ents))
+	for i, e := range r.Ents {
 		out[i] = ent{e}
+	}
+	if r.Partial { // the readable entries, and the folder named as not fully listed (OR1)
+		return out, &fs.PathError{Op: "readdir", Path: name, Err: fsread.ErrPartialFolder}
 	}
 	return out, nil
 }
@@ -454,7 +516,7 @@ func (c *Client) Deleted(ctx context.Context, emit func(source.Deleted) error) e
 			return err
 		}
 		var p DeletedPage
-		if err := c.call("W.Deleted", PageArgs{Cursor: cur}, &p, c.listTimeout(cur)); err != nil {
+		if err := c.callCtx(ctx, "W.Deleted", PageArgs{Cursor: cur}, &p, c.listTimeout(cur)); err != nil {
 			return err
 		}
 		for _, d := range p.Items {
@@ -479,7 +541,7 @@ func (c *Client) LiveExtents(ctx context.Context, emit func(path string, off, n 
 			return err
 		}
 		var p LivePage
-		if err := c.call("W.LiveExtents", PageArgs{Cursor: cur}, &p, c.listTimeout(cur)); err != nil {
+		if err := c.callCtx(ctx, "W.LiveExtents", PageArgs{Cursor: cur}, &p, c.listTimeout(cur)); err != nil {
 			return err
 		}
 		for _, r := range p.Items {
@@ -499,7 +561,14 @@ func (c *Client) LiveExtents(ctx context.Context, emit func(path string, off, n 
 
 // Validate runs validate.Check on a found file inside the worker.
 func (c *Client) Validate(ext string, volOff int64, extents [][2]int64, size int64) (bool, string, error) {
+	ok, why, _, err := c.ValidateChecked(ext, volOff, extents, size)
+	return ok, why, err
+}
+
+// ValidateChecked is Validate that also says whether a read of the file's data failed: a file
+// that doesn't check out because of bad sectors isn't a corrupt file (recover retries those).
+func (c *Client) ValidateChecked(ext string, volOff int64, extents [][2]int64, size int64) (ok bool, why string, readFailed bool, err error) {
 	var r ValidateReply
-	err := c.call("W.Validate", ValidateArgs{Ext: ext, VolOff: volOff, Extents: extents, Size: size}, &r, 10*c.stall)
-	return r.OK, r.Why, err
+	err = c.call("W.Validate", ValidateArgs{Ext: ext, VolOff: volOff, Extents: extents, Size: size}, &r, 10*c.stall)
+	return r.OK, r.Why, r.ReadFailed, err
 }

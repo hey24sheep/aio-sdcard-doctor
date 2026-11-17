@@ -16,9 +16,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/recovery"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/rescue"
 )
 
 // Step is one screen of the flow.
@@ -131,6 +133,10 @@ type Session struct {
 	rec        recoverState
 	tools      []ActionRow     // card tools for this card
 	undelete   *job.Capability // Undelete can't work on this card
+	imgInstead bool            // the copy stopped because the person chose a full backup image instead
+	listErr    string          // why the last drive listing failed ("" once one works)
+	verified   string          // manifest of the last rescue checked in this window with all files matching
+	looked     *lookup         // a typed path, looked up before taking the session (select-path)
 	wg         sync.WaitGroup
 
 	queue  []Event
@@ -232,9 +238,10 @@ func (s *Session) refresh() { s.setDrives(s.deps.ListDrives()) }
 
 func (s *Session) setDrives(ds []drives.Drive, err error) {
 	if err != nil {
-		s.err = err.Error()
+		s.listErr = "Couldn't list the drives: " + err.Error()
 		return
 	}
+	s.listErr = ""
 	sort.SliceStable(ds, func(i, j int) bool { return ds[i].Removable && !ds[j].Removable })
 	s.drives = ds
 }
@@ -243,7 +250,7 @@ func (s *Session) goStep(st Step) {
 	if s.step != st && s.step != StepRun { // a finished run is never a place to go back to
 		s.history = append(s.history, s.step)
 	}
-	s.step, s.err = st, ""
+	s.step, s.err, s.imgInstead = st, "", false
 }
 
 // nextAfter is the step after cur in the current action's flow.
@@ -269,21 +276,88 @@ func arg(c Command, k string) string { return strings.TrimSpace(c.Args[k]) }
 // Do performs one command. Errors are things the renderer should show; the view also carries them.
 func (s *Session) Do(c Command) error {
 	if c.Name == "refresh" { // reading the drives can be slow: never while holding the session
-		ds, err := s.deps.ListDrives()
-		s.mu.Lock()
-		s.setDrives(ds, err)
-		s.emitLocked(Event{Kind: "state"})
-		s.mu.Unlock()
-		return err
+		return s.listDrives()
+	}
+	var look *lookup
+	if c.Name == "select-path" { // looking a typed path up can be slow too (a sleeping disk)
+		look = lookPath(arg(c, "path"))
 	}
 	s.mu.Lock()
-	err := s.do(c)
-	if err != nil && !(s.step == StepRun && c.Name == "start") { // a second click on Start: nothing to show all run long
-		s.err = err.Error()
+	before := s.err
+	s.looked = look
+	err := s.doSafe(c)
+	s.looked = nil
+	switch {
+	case err != nil && s.step == StepRun && c.Name == "start":
+		err = nil // a second click on Start (or another window's): it is running, nothing to report
+	case err != nil && s.step != StepRun && s.step != StepResults:
+		s.err = err.Error() // a run's page and a result say what happened to the run, not a refused click
+	case err == nil && s.err == before && s.step != StepResults:
+		s.err = "" // done as asked: an earlier refusal no longer applies
 	}
 	s.emitLocked(Event{Kind: "state"})
 	s.mu.Unlock()
+	if err == nil && c.Name == "restart" { // back on the card list: list them, outside the session
+		s.listDrives()
+	}
 	return err
+}
+
+func (s *Session) listDrives() error {
+	ds, err := s.deps.ListDrives()
+	s.mu.Lock()
+	s.setDrives(ds, err)
+	s.emitLocked(Event{Kind: "state"})
+	s.mu.Unlock()
+	return err
+}
+
+// lookup is a typed path, normalised and looked up on disk.
+type lookup struct {
+	path string
+	st   os.FileInfo
+	err  error
+}
+
+func lookPath(p string) *lookup {
+	p = unquote(p)
+	if len(p) == 2 && p[1] == ':' { // "E:" means the drive, not E:'s current folder
+		p += `\`
+	}
+	l := &lookup{path: p}
+	if p != "" {
+		l.st, l.err = statFn(p)
+	}
+	return l
+}
+
+// doSafe: a panic in a command is a problem on the page; it must never leave the session locked.
+func (s *Session) doSafe(c Command) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("something went wrong: %v", p)
+		}
+	}()
+	return s.do(c)
+}
+
+// survive is deferred first thing in every background task: a panic there (a bug, a path the
+// engine didn't expect) becomes "Something went wrong" on the page instead of ending the whole
+// program — a closed GUI leaves a running copy's window and its lock behind. after puts the
+// session back on its feet (called with mu held).
+func (s *Session) survive(after func()) {
+	p := recover()
+	if p == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.busy = ""
+	if after != nil {
+		after()
+	}
+	s.err = fmt.Sprintf("Something went wrong: %v", p)
+	s.emitLocked(Event{Kind: "state"})
 }
 
 func (s *Session) do(c Command) error {
@@ -319,12 +393,13 @@ func (s *Session) do(c Command) error {
 		}
 		return fmt.Errorf("no drive %s — is the card still in?", root)
 	case "select-path": // a folder or a card image file
-		p := arg(c, "path")
+		l := s.looked
+		if l == nil { // looked up by Do, outside the session
+			l = &lookup{path: arg(c, "path"), err: errors.New("not looked up")}
+		}
+		p := l.path
 		if p == "" {
 			return errors.New("type a folder or image file")
-		}
-		if len(p) == 2 && p[1] == ':' { // "E:" means the drive, not E:'s current folder
-			p += `\`
 		}
 		for i := range s.drives {
 			if strings.EqualFold(strings.TrimRight(s.drives[i].Root, `\/`), strings.TrimRight(p, `\/`)) {
@@ -333,12 +408,11 @@ func (s *Session) do(c Command) error {
 				return nil
 			}
 		}
-		st, err := os.Stat(p)
-		if err != nil {
+		if l.err != nil {
 			return fmt.Errorf("can't find %s", p)
 		}
 		kind := KindFolder
-		if st.Mode().IsRegular() {
+		if l.st.Mode().IsRegular() {
 			kind = KindImage
 		}
 		s.selectCard(&drives.Drive{Root: p, Label: filepath.Base(p), FS: kind})
@@ -347,6 +421,9 @@ func (s *Session) do(c Command) error {
 			return errors.New("this action has no folder to change")
 		}
 		s.closeAction()
+		if s.req.Action == "recover" { // a new folder means a new listing, not the old picks
+			s.req.List, s.req.Select = true, nil
+		}
 		s.goStep(StepDest)
 	case "choose-action":
 		return s.chooseAction(arg(c, "action"))
@@ -367,7 +444,7 @@ func (s *Session) do(c Command) error {
 		s.req.Backup = id
 		s.goStep(s.nextAfter(StepChoice))
 	case "set-dest":
-		p := arg(c, "path")
+		p := unquote(arg(c, "path"))
 		if err := s.checkDest(p); err != nil {
 			return err
 		}
@@ -397,6 +474,7 @@ func (s *Session) do(c Command) error {
 			s.history = s.history[:len(s.history)-1] // checking again would only come back here
 		}
 		s.step, s.history, s.err = s.history[len(s.history)-1], s.history[:len(s.history)-1], ""
+		s.relist()
 		switch {
 		case s.step == StepReview: // check again: the earlier plan was closed
 			s.closeAction()
@@ -430,19 +508,27 @@ func (s *Session) do(c Command) error {
 	case "restart": // back to the card list, keeping nothing of the last flow
 		s.closeAction()
 		s.step, s.history, s.card, s.req, s.choices, s.result, s.progress, s.next, s.instr = StepDrive, nil, nil, Request{}, nil, nil, nil, nil, ""
+		s.err, s.imgInstead = "", false // the last run's problem isn't the card list's
 		s.rec = recoverState{}
-		s.refresh()
 	default:
 		return fmt.Errorf("unknown command %q", c.Name)
 	}
 	return nil
 }
 
+// relist: in the recover flow, a step before the pick list plans a new listing, never the
+// extraction of the picks made in an earlier one (the options or the folder may have changed).
+func (s *Session) relist() {
+	if s.req.Action == "recover" && s.step != StepRecoverList && !slices.Contains(s.history, StepRecoverList) {
+		s.req.List, s.req.Select = true, nil
+	}
+}
+
 func (s *Session) selectCard(d *drives.Drive) {
 	s.closeAction()
 	s.card = d
 	s.req = Request{From: d.Root}
-	s.result, s.progress, s.next = nil, nil, nil
+	s.result, s.progress, s.next, s.choices = nil, nil, nil, nil // nothing of another card's
 	s.goStep(StepAction)
 }
 
@@ -461,7 +547,10 @@ func (s *Session) chooseActionOpt(name string, withChoices bool) error {
 			}
 			from := s.req.From
 			s.req = Request{Action: name, From: from}
-			s.tools, s.undelete = nil, nil
+			s.tools, s.undelete, s.choices = nil, nil, nil
+			if name == "fix" { // a rescue checked in this window counts, as --manifest does on the command line
+				s.req.Manifest = s.verified
+			}
 			if name == "recover" {
 				s.req.List = true // first find what can come back, then the user ticks
 				if s.undelete = undeleteFor(*s.card); s.undelete != nil {
@@ -490,12 +579,16 @@ func (s *Session) loadTools() {
 	if s.deps.FixTools == nil {
 		return
 	}
+	for i := range s.tools { // until the check below finishes (stopping it leaves them so)
+		s.tools[i].Enabled, s.tools[i].Reason = false, "Not checked yet — press Back and choose Card tools again to check which tools work here"
+	}
 	s.busy = "Checking which card tools work here"
 	from := s.req.From
 	ctx := s.bg()
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer s.survive(nil)
 		caps := s.deps.FixTools(from)
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -520,6 +613,7 @@ func (s *Session) loadChoices() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		defer s.survive(nil)
 		cs, err := s.deps.Choices(ctx, from)
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -542,10 +636,27 @@ func (s *Session) checkDest(p string) error {
 	if !filepath.IsAbs(p) && !strings.Contains(p, `:\`) && !strings.HasPrefix(p, "/") {
 		return errors.New("use a full path, e.g. D:\\rescue or /home/me/rescue")
 	}
-	if s.card != nil && s.card.Root != "" && sameOrInside(p, s.card.Root) && s.req.Action != "image" {
+	if s.req.Action == "image" { // a file: the copy writes into its folder
+		if s.card != nil && s.card.Root != "" && sameOrInside(p, s.card.Root) {
+			return errors.New("that image file would be on the card itself — choose a file on another disk")
+		}
+		if err := destfs.CheckRoot(p); err != nil {
+			return errors.New(strings.Replace(err.Error(), "the destination folder", "the image file", 1))
+		}
+		return nil
+	}
+	if s.card != nil && s.card.Root != "" && sameOrInside(p, s.card.Root) {
 		return errors.New("that folder is on the card itself — choose a folder on another disk")
 	}
-	return nil
+	return destfs.CheckRoot(p)
+}
+
+// unquote drops one pair of quotes around a pasted path ("Copy as path" in Explorer adds them).
+func unquote(p string) string {
+	if len(p) >= 2 && p[0] == '"' && p[len(p)-1] == '"' {
+		return strings.TrimSpace(p[1 : len(p)-1])
+	}
+	return p
 }
 
 func sameOrInside(p, root string) bool {
@@ -638,6 +749,12 @@ func (s *Session) plan2() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
+		var a job.Action
+		defer s.survive(func() {
+			if c, ok := a.(interface{ Close() error }); ok {
+				c.Close()
+			}
+		})
 		a, err := s.deps.NewAction(req)
 		var p job.Plan
 		if err == nil {
@@ -721,6 +838,12 @@ func (s *Session) start(c Command) error {
 	go func() {
 		defer s.wg.Done()
 		defer cancel()
+		defer s.survive(func() { // the run is over: show it ended, with what is known
+			s.runCancel, s.pend = nil, nil
+			s.result = &job.Result{}
+			s.closeAction()
+			s.goStep(StepResults)
+		})
 		res, err := a.Run(ctx, s.env(), plan)
 		s.mu.Lock()
 		defer s.mu.Unlock()
@@ -730,12 +853,22 @@ func (s *Session) start(c Command) error {
 			s.rec = newRecoverState(r.Rows())
 			s.closeAction()
 			s.goStep(StepRecoverList)
-			s.err = s.errOr(err, ctx)
+			s.err = s.errOr(err, ctx, req.Action)
 		} else {
-			s.next = nextSteps(req, res)
+			s.next = nextSteps(req, res, err)
 			s.closeAction()
 			s.goStep(StepResults)
-			s.err = s.errOr(err, ctx)
+			s.err = s.errOr(err, ctx, req.Action)
+			if req.Action == "verify" && err == nil && res.Clean {
+				s.verified = req.Manifest
+			}
+			if errors.Is(err, rescue.ErrImageInstead) { // the person's choice, not a problem: the image is next
+				if s.card != nil && enabled(actionsFor(*s.card), "image") {
+					s.err, s.imgInstead = "", true
+				} else {
+					s.next = nil // an image file can't be imaged again; the error says what was chosen
+				}
+			}
 		}
 		s.emitLocked(Event{Kind: "done"})
 		s.emitLocked(Event{Kind: "state"})
@@ -743,9 +876,11 @@ func (s *Session) start(c Command) error {
 	return nil
 }
 
-func (s *Session) errOr(err error, ctx context.Context) string {
+// errOr is what a finished run says. A card tool stopped mid-way lets the system tool finish what
+// it started: what that tool then reports is the result, not "run it again to continue".
+func (s *Session) errOr(err error, ctx context.Context, action string) string {
 	switch {
-	case err != nil && ctx.Err() != nil:
+	case err != nil && ctx.Err() != nil && (action != "fix" || errors.Is(err, context.Canceled)):
 		return "Stopped. Run the same action again to continue where it stopped."
 	case err != nil:
 		return err.Error()
@@ -803,15 +938,29 @@ func (p prompter) Ask(ctx context.Context, is job.Issue) job.Choice {
 
 func (s *Session) nextAction(name string) error {
 	prev := s.req
+	fromImage := name == "rescue" && prev.Action == "image"
+	if fromImage && !isFile(prev.Dest) {
+		return fmt.Errorf("the image file %s isn't there (a compressed image keeps only the .xz) — copy from the card instead", prev.Dest)
+	}
 	// a new flow from the same card: Back leads to "What to do", never to an old run's results
 	s.history, s.step = []Step{StepDrive}, StepAction
+	if fromImage { // copy from the image just made, as if it had been chosen as the source: the card can rest
+		s.card = &drives.Drive{Root: prev.Dest, Label: filepath.Base(prev.Dest), FS: KindImage}
+		s.req = Request{From: prev.Dest}
+	}
 	if err := s.chooseAction(name); err != nil {
 		return err
 	}
-	if name == "verify" && prev.Action == "rescue" && prev.Dest != "" {
+	switch {
+	case name == "verify" && prev.Action == "rescue" && prev.Dest != "":
 		s.req.Manifest = filepath.Join(prev.Dest, "Reports", "manifest.json")
+	case name == "image" && prev.Action == "rescue" && prev.Dest != "": // "image instead": next to the copy so far
+		s.req.Dest = filepath.Join(prev.Dest, "card.img")
 	}
 	return nil
 }
+
+// statFn is a seam (tests make a slow disk).
+var statFn = os.Stat
 
 func errorf(f string, a ...any) error { return fmt.Errorf(f, a...) }

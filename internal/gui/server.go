@@ -103,6 +103,7 @@ func Start(ctx context.Context, s *app.Session, opt Options) (*Server, error) {
 		defer sv.removeLock()
 		t := time.NewTicker(time.Second)
 		defer t.Stop()
+		last, unseen := s.Step(), false
 		for {
 			select {
 			case <-ctx.Done():
@@ -111,7 +112,14 @@ func Start(ctx context.Context, s *app.Session, opt Options) (*Server, error) {
 			case <-t.C:
 				step := s.Step() // outside sv.mu: requests never wait on the session
 				sv.mu.Lock()
-				stop := idle > 0 && shouldStop(sv.clients, time.Since(sv.lastSeen), step, sv.everSeen, idle)
+				// a step reached with no window open (a long listing finished) waits for a window
+				if sv.clients > 0 {
+					unseen = false
+				} else if step != last {
+					unseen = true
+				}
+				last = step
+				stop := idle > 0 && shouldStop(sv.clients, time.Since(sv.lastSeen), step, sv.everSeen, unseen, idle)
 				sv.mu.Unlock()
 				if stop {
 					cancel()
@@ -124,12 +132,20 @@ func Start(ctx context.Context, s *app.Session, opt Options) (*Server, error) {
 
 // shouldStop: only when no window is connected and no job runs, after `after` since the last
 // window left — or 10 minutes when no window has ever connected (the link may be opened late).
-func shouldStop(clients int, idleFor time.Duration, step app.Step, everSeen bool, after time.Duration) bool {
+// A pick list or result that appeared after the last window closed (unseen) is kept until a
+// window shows it (`gui` reopens it) — for unseenFor at most: nobody is coming back for it then,
+// and its reports are on disk anyway.
+func shouldStop(clients int, idleFor time.Duration, step app.Step, everSeen, unseen bool, after time.Duration) bool {
 	if !everSeen {
 		after = max(after, 10*time.Minute)
 	}
+	if unseen && (step == app.StepRecoverList || step == app.StepResults) && idleFor < unseenFor {
+		return false
+	}
 	return clients == 0 && step != app.StepRun && idleFor >= after
 }
+
+const unseenFor = 12 * time.Hour
 
 // Reopen asks a running GUI of this user (found through gui.lock in dir) for a fresh link.
 func Reopen(dir string, admin bool) (string, bool) {
@@ -141,6 +157,12 @@ func Reopen(dir string, admin bool) (string, bool) {
 	if json.Unmarshal(b, &l) != nil || l.Port == 0 || admin && !l.Admin {
 		return "", false // an elevated `gui` starts its own window: reopening a plain one would loop
 	}
+	return mint(l)
+}
+
+// mint asks the GUI a lock names for a fresh link, with the lock's secret: only that GUI answers
+// it (any other program now on the same port doesn't), so this is also how a lock is told live.
+func mint(l lockFile) (string, bool) {
 	req, _ := http.NewRequest("POST", fmt.Sprintf("http://127.0.0.1:%d/internal/mint", l.Port), nil)
 	req.Header.Set("X-Mint", l.Mint)
 	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
@@ -214,6 +236,9 @@ func (sv *Server) guard(next http.Handler) http.Handler {
 		}
 		if r.URL.Path == "/" && r.URL.Query().Get("t") != "" {
 			if sv.authed(r) { // already logged in (an old link reopened): just show the app
+				sv.mu.Lock()
+				delete(sv.tokens, r.URL.Query().Get("t")) // single use here too: nobody else signs in with it later
+				sv.mu.Unlock()
 				http.Redirect(w, r, "/", http.StatusSeeOther)
 				return
 			}
@@ -254,7 +279,11 @@ func (sv *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	http.SetCookie(w, &http.Cookie{Name: sv.cookieName(), Value: sess, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode})
-	http.Redirect(w, r, "/", http.StatusSeeOther) // drop the token from the address bar
+	// on to the app, dropping the token from the address bar — from this page, not by a redirect:
+	// opened from the launch page (a file), a redirect would still count as a cross-site
+	// navigation and the SameSite=Strict cookie just set would not be sent with it
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, `<!doctype html><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=/"><title>SD card doctor</title><p><a href="/">Open SD card doctor</a></p>`)
 }
 
 // cookieName includes the port: cookies don't separate ports, so two GUIs on one computer would
@@ -427,14 +456,20 @@ func (sv *Server) apiOpenDest(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 422, map[string]string{"error": "nothing to open"})
 		return
 	}
-	if st, err := os.Stat(d); err == nil && !st.IsDir() {
-		d = filepath.Dir(d)
-	}
-	if err := openFolder(d); err != nil {
+	if err := openFolder(folderToOpen(d)); err != nil {
 		writeJSON(w, 422, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, 200, map[string]string{})
+}
+
+// folderToOpen is dest itself when it is an existing folder; otherwise (an image file, made or
+// not) the folder it is in.
+func folderToOpen(dest string) string {
+	if st, err := os.Stat(dest); err == nil && st.IsDir() {
+		return dest
+	}
+	return filepath.Dir(dest)
 }
 
 var openFolder = func(dir string) error {
@@ -489,7 +524,8 @@ func launchCommands(goos, url, cacheDir string, exists func(string) bool) [][]st
 // OpenAppWindow opens url in an app-style browser window (Edge/Chrome --app), else the default
 // browser. The browser always runs as the normal user.
 func OpenAppWindow(url string) error {
-	cache, _ := os.UserCacheDir()
+	cache := cacheBase(os.UserCacheDir())
+	url = launchTarget(runtime.GOOS, url, filepath.Join(cache, "aio-sdcard-doctor"))
 	exists := func(p string) bool {
 		if filepath.IsAbs(p) {
 			_, err := os.Stat(p)

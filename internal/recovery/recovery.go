@@ -15,6 +15,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -223,6 +224,11 @@ func (r *Recover) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 						Choices: []job.Choice{job.Stop}, Default: job.Stop})
 				}
 			}
+			if was, ok, _ := job.Get[int64](st, bucketVolume, "offset"); ok && was != r.volOffset() {
+				p.Issues = append(p.Issues, job.Issue{Kind: "dest-other-volume", Severity: job.Block,
+					Title: "This folder holds a recovery of another volume of this card", Detail: "Choose a new folder for this volume.",
+					Choices: []job.Choice{job.Stop}, Default: job.Stop})
+			}
 			st.Close()
 		}
 	}
@@ -365,6 +371,51 @@ func annotate(rows []Row, live []liveRun) {
 	}
 }
 
+// sharedSpace marks deleted files whose assumed runs overlap as Poor: the space can hold only one
+// of them and nothing tells which (adversarial pass 2, SR2). Two records of the very same data
+// (a renamed file's old record) are not a conflict.
+func sharedSpace(rows []Row) {
+	type run struct {
+		start, end int64
+		i          int
+	}
+	var rs []run
+	for i, rw := range rows {
+		if rw.Kind == "deleted" && (rw.internal == "recoverable" || rw.internal == "fragmented-unknown") {
+			for _, e := range rw.Extents {
+				if e[1] > 0 {
+					rs = append(rs, run{e[0], e[0] + e[1], i})
+				}
+			}
+		}
+	}
+	sort.Slice(rs, func(a, b int) bool { return rs[a].start < rs[b].start })
+	hit := map[int]bool{}
+	for a := range rs {
+		for b := a + 1; b < len(rs) && rs[b].start < rs[a].end; b++ {
+			if i, j := rs[a].i, rs[b].i; i != j && !slices.Equal(rows[i].Extents, rows[j].Extents) {
+				hit[i], hit[j] = true, true
+			}
+		}
+	}
+	for i := range hit {
+		rows[i].internal, rows[i].State = "fragmented-unknown", Poor
+		rows[i].Comment = "Its space is also claimed by another deleted file — may come back damaged"
+	}
+}
+
+// volOffset is where the volume this run reads starts (0: the whole card).
+func (r *Recover) volOffset() int64 {
+	if vs := r.src.Volumes(); r.src.ReadError() == "" && r.Volume < len(vs) {
+		return vs[r.Volume].Offset
+	}
+	return 0
+}
+
+// bucketVolume records which volume a folder's recovery is of: results are keyed by path and
+// offset inside the volume, so another volume's would look already copied (adversarial pass 2).
+const bucketVolume = "recover_volume"
+
 const (
 	bucketDeep  = "deep_index"
 	bucketState = "deep_state"
@@ -373,6 +424,7 @@ const (
 
 type storedHit struct {
 	Offset, Size int64
+	Format       string // the carver's format name (empty in an index from before it was kept)
 	Ext          string
 	Cat          profile.Category
 	Complete     bool
@@ -390,6 +442,8 @@ func (r *Recover) index(ctx context.Context, env job.Env, st *job.Store, dev io.
 		switch {
 		case ctx.Err() != nil:
 			return ctx.Err()
+		case cardTrouble(err):
+			return err
 		case err != nil && !errors.Is(err, errors.ErrUnsupported) && env.Log != nil:
 			env.Log("warn", "Where live files sit is only partly known ("+err.Error()+"): deep scan may also list live files")
 		}
@@ -409,14 +463,23 @@ func (r *Recover) index(ctx context.Context, env job.Env, st *job.Store, dev io.
 					Extents: d.Extents, internal: d.State})
 				return nil
 			})
-			if errors.Is(err, worker.ErrListCapped) && env.Log != nil {
-				env.Log("warn", err.Error()+"; the files listed so far are used")
-			} else if err != nil && !errors.Is(err, errors.ErrUnsupported) {
+			switch {
+			case err == nil, errors.Is(err, errors.ErrUnsupported):
+			case errors.Is(err, worker.ErrListCapped):
+				warn(env, err.Error()+"; the files listed so far are used")
+			case ctx.Err() != nil:
+				return ctx.Err()
+			case cardTrouble(err):
 				return err
+			case r.Deep: // a damaged file system: the deep scan doesn't need it
+				warn(env, "The list of deleted files could only be read in part ("+err.Error()+"); the deep scan looks for files by their signatures anyway")
+			default:
+				return fmt.Errorf("the list of deleted files can't be read (%w) — a deep scan (--deep) looks for files without it", err)
 			}
 		}
 	}
 	r.rows = dedupe(r.rows)
+	sharedSpace(r.rows)
 	annotate(r.rows, live)
 	if !r.Deep {
 		return nil
@@ -441,18 +504,27 @@ func (r *Recover) index(ctx context.Context, env job.Env, st *job.Store, dev io.
 	job.ForEach(st, bucketDeep, func(_ string, h storedHit) error {
 		seen[h.Offset] = true
 		r.rows = append(r.rows, carvedRow(h))
+		opt.Found = append(opt.Found, carve.Hit{Offset: h.Offset, Size: h.Size, Format: h.Format, Complete: h.Complete})
 		return nil
 	})
+	badSeen := map[int64]bool{} // stored as soon as found, so the area before a crash comes again
 	job.ForEach(st, bucketBad, func(_ string, a [2]int64) error {
+		badSeen[a[0]] = true
 		r.rows = append(r.rows, unreadableRow(a[0], a[1]))
 		return nil
 	})
 	if pos >= volSize {
 		return nil
 	}
+	// finds are stored together with the checkpoint after them, in one transaction (one sync
+	// per checkpoint, not per find); ones lost in a crash before it are found again from pos
+	batch := job.NewBatch(st)
 	var storeErr error
 	opt.Unreadable = func(off, n int64) {
-		if err := job.Put(st, bucketBad, fmt.Sprintf("%016x", off), [2]int64{off, n}); err != nil && storeErr == nil {
+		if badSeen[off] {
+			return
+		}
+		if err := job.BatchPut(batch, bucketBad, fmt.Sprintf("%016x", off), [2]int64{off, n}); err != nil && storeErr == nil {
 			storeErr = err
 		}
 		r.rows = append(r.rows, unreadableRow(off, n))
@@ -467,8 +539,8 @@ func (r *Recover) index(ctx context.Context, env job.Env, st *job.Store, dev io.
 		if seen[h.Offset] { // every type is kept: --types is applied when recovering (EXCLUDED rows)
 			return nil
 		}
-		sh := storedHit{Offset: h.Offset, Size: h.Size, Ext: h.Ext, Cat: h.Cat, Complete: h.Complete, Unreadable: h.Unreadable}
-		if err := job.Put(st, bucketDeep, fmt.Sprintf("%016x", h.Offset), sh); err != nil {
+		sh := storedHit{Offset: h.Offset, Size: h.Size, Format: h.Format, Ext: h.Ext, Cat: h.Cat, Complete: h.Complete, Unreadable: h.Unreadable}
+		if err := job.BatchPut(batch, bucketDeep, fmt.Sprintf("%016x", h.Offset), sh); err != nil {
 			return err
 		}
 		r.rows = append(r.rows, carvedRow(sh))
@@ -477,8 +549,14 @@ func (r *Recover) index(ctx context.Context, env job.Env, st *job.Store, dev io.
 		if env.Progress != nil {
 			env.Progress(job.Progress{Phase: "Deep scan", Done: p, Total: volSize})
 		}
-		return job.Put(st, bucketState, "pos", p)
+		if err := job.BatchPut(batch, bucketState, "pos", p); err != nil {
+			return err
+		}
+		return batch.Flush()
 	})
+	if ferr := batch.Flush(); err == nil { // stopped between checkpoints: keep what was found
+		err = ferr
+	}
 	if err == nil {
 		err = storeErr
 	}
@@ -623,6 +701,9 @@ func contains(l []string, s string) bool {
 // Run indexes (resumable), then extracts the chosen files, each validated first.
 func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, error) {
 	r.defaults()
+	if c, ok := r.src.(interface{ SetContext(context.Context) }); ok {
+		c.SetContext(ctx) // every reader call (reads, checks, a respawn) ends on Stop
+	}
 	res := job.Result{Counters: map[string]int{}, Clean: true}
 	var roots []string
 	if !rescue.IsDevicePath(r.From) {
@@ -651,6 +732,18 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 		return res, err
 	}
 	defer unlock()
+	// and the card's disk, which every job reading or writing it takes (OA3)
+	id := r.src.Identity()
+	if id.PhysicalID == "" && rescue.IsDevicePath(r.From) {
+		id.PhysicalID = drives.PhysicalOf(r.From)
+	}
+	if k := id.DiskLockKey(); k != "" {
+		unlockDisk, err := job.LockSource(k)
+		if err != nil {
+			return res, err
+		}
+		defer unlockDisk()
+	}
 	if release, err := job.Inhibit("recovering files from a card"); err == nil {
 		defer release()
 	}
@@ -662,6 +755,9 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 	volOff, volSize := int64(0), devSize
 	if vs := r.src.Volumes(); r.src.ReadError() == "" && r.Volume < len(vs) {
 		volOff, volSize = vs[r.Volume].Offset, vs[r.Volume].Size
+	}
+	if err := job.Put(st, bucketVolume, "offset", volOff); err != nil {
+		return res, err
 	}
 	if err := r.index(ctx, env, st, dev, volOff, volSize); err != nil {
 		return res, err
@@ -738,7 +834,23 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 			e.Status, e.Error, res.Clean = manifest.FAILED, tooLargeForFAT, false
 		} else {
 			var err error
-			e.Status, e.Error, e.Dest, e.SHA256, err = r.extract(ctx, rw, dests[i], e.Source, dev, volOff, sink, cp, rescued, seen, good, damaged)
+			for {
+				e.Status, e.Error, e.Dest, e.SHA256, err = r.extract(ctx, rw, dests[i], e.Source, dev, volOff, sink, cp, rescued, seen, good, damaged)
+				var ce cardError
+				if !errors.As(err, &ce) {
+					break
+				}
+				status, why, again, cerr := r.cardTrouble(ctx, env, ce.err)
+				if cerr != nil {
+					sink.Close()
+					r.writeReports(out, m, stamp, &res) // the files so far still get their reports
+					return res, cerr
+				}
+				if !again {
+					e.Status, e.Error, err = status, why, nil
+					break
+				}
+			}
 			if err != nil && ioerr.IsTooLarge(err) {
 				e.Status, e.Error, e.Dest, e.SHA256, err = manifest.FAILED, tooLargeForFAT, "", "", nil
 				res.Clean = false
@@ -751,7 +863,7 @@ func (r *Recover) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result,
 				}
 				return res, fmt.Errorf("writing to the destination: %w", err)
 			}
-			if e.Status == damaged {
+			if e.Status == damaged || e.Status == manifest.STALLED || e.Status == manifest.FAILED {
 				res.Clean = false
 			}
 			if e.Status == good && rw.State == Poor {
@@ -805,25 +917,60 @@ func (r *Recover) extract(ctx context.Context, rw Row, dest, key string, dev io.
 		return damaged, "no data location recorded", "", "", nil
 	}
 	src := source.ExtentReader{Dev: dev, Off: volOff, Extents: rw.Extents}
-	ok, why := false, ""
+	ok, why, readFailed := false, "", false
 	if v, isV := r.src.(validator); isV { // untrusted decoding runs in the worker (R17)
 		var err error
-		if ok, why, err = v.Validate(rw.Ext, volOff, rw.Extents, rw.Size); err != nil {
+		if rc, isRC := r.src.(readChecker); isRC {
+			ok, why, readFailed, err = rc.ValidateChecked(rw.Ext, volOff, rw.Extents, rw.Size)
+		} else {
+			ok, why, err = v.Validate(rw.Ext, volOff, rw.Extents, rw.Size)
+			readFailed = !ok // not told: count, within maxRecount
+		}
+		if cardTrouble(err) {
+			return "", "", "", "", cardError{err}
+		}
+		if err != nil {
 			ok, why = false, "the file could not be checked: "+err.Error()
 		}
-	} else if ok, why = validate.Check(rw.Ext, src, rw.Size); ok {
-		note := why
-		if ok, why = carve.Verify(rw.Ext, src, rw.Size); ok {
-			why = note
+	} else {
+		w := &readWatch{r: src}
+		if ok, why = validate.Check(rw.Ext, w, rw.Size); ok {
+			note := why
+			if ok, why = carve.Verify(rw.Ext, w, rw.Size); ok {
+				why = note
+			}
 		}
+		if w.card != nil {
+			return "", "", "", "", cardError{w.card}
+		}
+		readFailed = w.failed
 	}
 	if !ok {
+		if readFailed { // bad sectors, not a corrupt file?
+			n, all, err := unreadable(ctx, src, rw.Size)
+			if err != nil {
+				return "", "", "", "", cardError{err}
+			}
+			switch {
+			case n > 0 && all:
+				why = fmt.Sprintf("%d bytes could not be read", n)
+			case n > 0:
+				why = fmt.Sprintf("at least %d bytes could not be read", n)
+			}
+		}
 		return damaged, why, "", "", nil
 	}
 	var dup bool
 	var bad int64
+	var cardErr error // reading the card failed, not writing the copy
 	stored, res, err := sink.Put(ctx, dest, rw.MTime,
-		func(w io.Writer) (salvage.Result, error) { return cp.Copy(ctx, src, rw.Size, w) },
+		func(w io.Writer) (salvage.Result, error) {
+			res, err := cp.Copy(ctx, src, rw.Size, w)
+			if cardTrouble(err) {
+				cardErr = err
+			}
+			return res, err
+		},
 		func(res salvage.Result) bool {
 			sum := strings.ToUpper(hex.EncodeToString(res.Sum[:]))
 			bad = res.Bad
@@ -832,6 +979,8 @@ func (r *Recover) extract(ctx context.Context, rw Row, dest, key string, dev io.
 		})
 	sum := strings.ToUpper(hex.EncodeToString(res.Sum[:]))
 	switch {
+	case cardErr != nil:
+		return "", "", "", "", cardError{cardErr}
 	case err != nil:
 		return "", "", "", "", err
 	case bad > 0:
@@ -841,6 +990,111 @@ func (r *Recover) extract(ctx context.Context, rw Row, dest, key string, dev io.
 	}
 	seen[sum] = key
 	return good, why, stored, sum, nil // why: a note on a file that passed (validate.NotDecoded)
+}
+
+// maxRecount bounds how much is read again to count a file's unreadable bytes.
+const maxRecount = 16 << 20
+
+// unreadable counts the bytes of a file that can't be read (64 KiB at a time, a failed piece
+// again 4 KiB at a time, no retries): only a file whose check hit a read error is read again for
+// this, and only its first maxRecount/2 bytes (each may be read twice); all says the count covers
+// the whole file. A card that stopped answering is err.
+func unreadable(ctx context.Context, r io.ReaderAt, size int64) (bad int64, all bool, err error) {
+	failed := func(b []byte, off int64) bool {
+		got, rerr := r.ReadAt(b, off)
+		if cardTrouble(rerr) && err == nil {
+			err = rerr
+		}
+		return got < len(b) && rerr != nil && !errors.Is(rerr, io.EOF)
+	}
+	end := min(size, maxRecount/2)
+	buf := make([]byte, 64<<10)
+	for off := int64(0); off < end && ctx.Err() == nil && err == nil; off += int64(len(buf)) {
+		n := min(int64(len(buf)), end-off)
+		if !failed(buf[:n], off) {
+			continue
+		}
+		for o := int64(0); o < n && err == nil; o += 4096 {
+			if k := min(4096, n-o); failed(buf[:k], off+o) {
+				bad += k
+			}
+		}
+	}
+	return bad, end == size, err
+}
+
+// readChecker is a validator that also says whether checking the file hit a read error (the
+// worker client): only then is the file read again to count its unreadable bytes.
+type readChecker interface {
+	ValidateChecked(ext string, volOff int64, extents [][2]int64, size int64) (ok bool, why string, readFailed bool, err error)
+}
+
+// readWatch notes whether a read failed, and the first failure that is the card's, not a sector's.
+type readWatch struct {
+	r      io.ReaderAt
+	failed bool
+	card   error
+}
+
+func (w *readWatch) ReadAt(p []byte, off int64) (int, error) {
+	n, err := w.r.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		w.failed = true
+		if cardTrouble(err) && w.card == nil {
+			w.card = err
+		}
+	}
+	return n, err
+}
+
+// cardTrouble: the read failed because of the card or its reader, not a bad sector of this file.
+func cardTrouble(err error) bool {
+	return errors.Is(err, source.ErrTooManyRestarts) || errors.Is(err, source.ErrStalled) ||
+		errors.Is(err, source.ErrWorkerCrashed) || errors.Is(err, source.ErrDifferentCard)
+}
+
+// cardError carries card trouble out of extract.
+type cardError struct{ err error }
+
+func (c cardError) Error() string { return c.err.Error() }
+func (c cardError) Unwrap() error { return c.err }
+
+// cardTrouble answers card trouble during extraction the way rescue does: a card that stopped
+// responding asks Wait (keep trying this file) or Stop; a read that stalled or crashed the
+// reader marks this file and the run goes on; another card in the reader stops the run.
+func (r *Recover) cardTrouble(ctx context.Context, env job.Env, err error) (manifest.Status, string, bool, error) {
+	switch {
+	case ctx.Err() != nil:
+		return "", "", false, ctx.Err()
+	case errors.Is(err, source.ErrTooManyRestarts):
+		is := job.Issue{Kind: "card-not-responding", Severity: job.Warn, Title: "The card stopped responding",
+			Detail:  "Wait and keep trying (put the card back first if it came out), or stop. Files recovered so far are kept; running the same command again continues.",
+			Choices: []job.Choice{job.Wait, job.Stop}, Default: job.Stop}
+		var c job.Choice
+		if env.Prompt != nil {
+			c = env.Prompt.Ask(ctx, is)
+		} else {
+			c = job.AutoPrompter{}.Ask(ctx, is)
+		}
+		if c != job.Wait {
+			return "", "", false, errors.New("stopped: the card stopped responding — run the same command again to continue")
+		}
+		if b, ok := r.src.(interface{ ResetBudget() }); ok {
+			b.ResetBudget()
+		}
+		return "", "", true, nil
+	case errors.Is(err, source.ErrStalled):
+		return manifest.STALLED, err.Error(), false, nil
+	case errors.Is(err, source.ErrWorkerCrashed):
+		return manifest.FAILED, "the card reader crashed on this file: " + err.Error(), false, nil
+	}
+	return "", "", false, err
+}
+
+func warn(env job.Env, msg string) {
+	if env.Log != nil {
+		env.Log("warn", msg)
+	}
 }
 
 // writeReports writes the recover CSV and manifest.json for every row so far.

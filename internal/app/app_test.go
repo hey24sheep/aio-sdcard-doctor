@@ -71,7 +71,7 @@ type rig struct {
 	tools  []job.Capability // what fix.Available would say (nil: not known)
 }
 
-var card = drives.Drive{Root: `Q:\`, Label: "CAMERA", FS: "exFAT", Total: 64 << 30, Removable: true, PhysicalID: "MOCK7", Device: `\\.\Q:`}
+var card = drives.Drive{Root: `Q:\`, Label: "CAMERA", FS: "exFAT", Total: 64 << 30, Removable: true, PhysicalID: "MOCK7-app", Device: `\\.\Q:`}
 
 func newRig(t *testing.T, ds ...drives.Drive) *rig {
 	t.Helper()

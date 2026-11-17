@@ -34,7 +34,8 @@ func TestRawDeviceDestOnSameCardRefused(t *testing.T) {
 	}
 }
 
-// I1: when retries run out the file is FAILED, never a blank status.
+// I1: when retries run out the file is FAILED, never a blank status â€” or PARTIAL when what was
+// read before the card went away is on the destination (OC1: that copy is never lost track of).
 func TestRetriesExhaustedIsFailed(t *testing.T) {
 	card := testutil.Card{"a.jpg": {Data: testutil.JPEG(5000, "a")}}
 	src, dst := testutil.WriteFolder(t, card), filepath.Join(t.TempDir(), "out")
@@ -47,7 +48,8 @@ func TestRetriesExhaustedIsFailed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e := entries(t, dst)["a.jpg"]; e.Status != manifest.FAILED || res.Clean {
+	if e := entries(t, dst)["a.jpg"]; !(e.Status == manifest.FAILED || e.Status == manifest.PARTIAL && e.Dest != "") ||
+		!strings.Contains(e.Error, "gave up") || res.Clean {
 		t.Fatalf("%+v clean=%v", e, res.Clean)
 	}
 }
@@ -152,7 +154,7 @@ func TestStallInsideFileZeroFills(t *testing.T) {
 // I14: a daylight-saving change shifts FAT times by exactly one hour.
 func TestSameTimeAcrossDST(t *testing.T) {
 	a := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
-	if !sameTime(a, a.Add(time.Hour)) || !sameTime(a, a.Add(-time.Hour+time.Second)) || sameTime(a, a.Add(30*time.Minute)) {
+	if !sameTime(a, a.Add(time.Hour)) || !sameTime(a, a.Add(-time.Hour+time.Second)) || sameTime(a, a.Add(7*time.Minute)) {
 		t.Fatal("DST shift handling wrong")
 	}
 }

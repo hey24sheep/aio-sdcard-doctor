@@ -4,6 +4,7 @@ package scan
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"io/fs"
 	"path"
@@ -42,6 +43,9 @@ type Inventory struct {
 	Suggested  map[string]Group
 }
 
+// maxDepth caps folder nesting (like the exFAT reader): deeper means a damaged folder loop.
+const maxDepth = 256
+
 // sniffBytes is how much of an unnamed fragment is read to identify it.
 const sniffBytes = 512
 
@@ -75,6 +79,7 @@ func Scan(ctx context.Context, src source.Source, active []profile.Profile) (Inv
 		mtime time.Time
 	}
 	var files []raw
+	seen := map[string]int{}
 	err := fs.WalkDir(src, ".", func(p string, d fs.DirEntry, err error) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
@@ -84,12 +89,25 @@ func Scan(ctx context.Context, src source.Source, active []profile.Profile) (Inv
 				return err
 			}
 			inv.Unlistable = append(inv.Unlistable, p+": "+err.Error())
-			if d == nil || d.IsDir() {
+			if d == nil {
+				return fs.SkipDir
+			}
+			// A damaged folder can still give the entries it could read: walk those (the folder
+			// stays reported as not fully listed), so one bad sector never hides all its files.
+			return nil
+		}
+		if d.IsDir() {
+			if p != "." && strings.Count(p, "/")+1 > maxDepth {
+				// A folder entry pointing back at a parent makes an endless tree on a damaged card.
+				inv.Unlistable = append(inv.Unlistable, p+": folders nested more than 256 levels deep (possible damage — a folder that loops back on itself)")
 				return fs.SkipDir
 			}
 			return nil
 		}
-		if d.IsDir() {
+		if seen[p]++; seen[p] > 1 {
+			// A damaged folder can list one name twice: only the first is copied, the extra entry
+			// is reported so nothing is skipped silently.
+			inv.Unreadable = append(inv.Unreadable, fmt.Sprintf("%s (entry %d with this name): the same name appears twice in a damaged folder — try Image or Deep scan", p, seen[p]))
 			return nil
 		}
 		fi, err := d.Info()

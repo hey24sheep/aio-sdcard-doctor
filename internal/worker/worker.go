@@ -16,6 +16,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/carve"
@@ -60,6 +61,10 @@ type OpenReply struct {
 	Volumes []fsread.Volume
 	Caps    []job.Capability
 	ReadErr string // the file system can't be read (the raw device still can)
+	// Samples are content hashes of a raw device, taken at every open whatever ID holds: after a
+	// respawn they tell the same card from a stranger when only one of the two opens could read
+	// a file-system serial (OA1).
+	Samples []drives.FPBlock
 }
 
 // HandleReply is an opened file or device.
@@ -153,20 +158,21 @@ func (s *Service) Open(spec Spec, r *OpenReply) (err error) {
 		return wireErr(err)
 	}
 	s.dev, s.devSize, s.closers = dev, size, append(s.closers, c)
+	samples := rawSamples(dev, size)
 	vols, err := fsread.Probe(dev, size)
 	if err != nil {
-		*r = OpenReply{Kind: "unknown", ReadErr: err.Error(),
-			ID: drives.Identity{Size: uint64(size), Fingerprint: rawSamples(dev, size)}}
+		*r = OpenReply{Kind: "unknown", ReadErr: err.Error(), Samples: samples,
+			ID: drives.Identity{Size: uint64(size), Fingerprint: samples}}
 		return nil
 	}
 	if spec.Volume < 0 || spec.Volume >= len(vols) {
 		return fmt.Errorf("volume %d not found (%d on this card)", spec.Volume, len(vols))
 	}
 	v := vols[spec.Volume]
-	*r = OpenReply{Kind: v.FS, Volumes: vols, Caps: fsread.Capabilities(&v, nil),
+	*r = OpenReply{Kind: v.FS, Volumes: vols, Caps: fsread.Capabilities(&v, nil), Samples: samples,
 		ID: drives.Identity{Size: uint64(size), FSSerial: v.Serial, Label: v.Label}}
 	if drives.NormalizeSerial(v.Serial) == "" {
-		r.ID.Fingerprint = rawSamples(dev, size) // no serial (RAW card): tell same-size cards apart
+		r.ID.Fingerprint = samples // no serial (RAW card): tell same-size cards apart
 	}
 	src, err := fsread.Open(dev, v)
 	if err != nil {
@@ -185,15 +191,23 @@ func (s *Service) source() (source.Source, error) {
 	return s.src, nil
 }
 
+// DirReply is a directory listing. Partial: part of the folder couldn't be read, Ents are the
+// entries that could (net/rpc drops the reply of a call that fails, so this is no error).
+type DirReply struct {
+	Ents    []DirEnt
+	Partial bool
+}
+
 // ReadDir lists a directory.
-func (s *Service) ReadDir(name string, r *[]DirEnt) (err error) {
+func (s *Service) ReadDir(name string, r *DirReply) (err error) {
 	defer catch(&err)
 	src, err := s.source()
 	if err != nil {
 		return err
 	}
 	es, err := src.ReadDir(name)
-	if err != nil {
+	partial := errors.Is(err, fsread.ErrPartialFolder)
+	if err != nil && !partial {
 		return wireErr(err)
 	}
 	out := make([]DirEnt, 0, len(es))
@@ -206,7 +220,7 @@ func (s *Service) ReadDir(name string, r *[]DirEnt) (err error) {
 		}
 		out = append(out, DirEnt{Name: e.Name(), Size: fi.Size(), MTime: fi.ModTime(), Dir: e.IsDir(), Mode: typ})
 	}
-	*r = out
+	*r = DirReply{Ents: out, Partial: partial}
 	return nil
 }
 
@@ -329,6 +343,13 @@ func (s *Service) Hook(name string, _ *struct{}) (err error) {
 			keep = append(keep, b)
 		}
 		_ = keep
+	default:
+		var from, to int64
+		if _, err := fmt.Sscanf(name, "BadArea:%d:%d", &from, &to); err == nil {
+			s.mu.Lock()
+			s.dev = badAreas{r: s.dev, bad: [][2]int64{{from, to}}}
+			s.mu.Unlock()
+		}
 	}
 	return nil
 }
@@ -482,10 +503,41 @@ type ValidateArgs struct {
 	Size    int64
 }
 
-// ValidateReply is validate.Check's answer.
+// ValidateReply is validate.Check's answer. ReadFailed: a read of the file's data failed (bad
+// sectors), so "not OK" may be the card, not the file.
 type ValidateReply struct {
-	OK  bool
-	Why string
+	OK         bool
+	Why        string
+	ReadFailed bool
+}
+
+// failSpy notes any read that fails (end of data aside).
+type failSpy struct {
+	r      io.ReaderAt
+	failed atomic.Bool
+}
+
+func (f *failSpy) ReadAt(p []byte, off int64) (int, error) {
+	n, err := f.r.ReadAt(p, off)
+	if err != nil && !errors.Is(err, io.EOF) {
+		f.failed.Store(true)
+	}
+	return n, err
+}
+
+// badAreas fails reads touching any of its [from, to) areas (a test hook: a card's bad sectors).
+type badAreas struct {
+	r   io.ReaderAt
+	bad [][2]int64
+}
+
+func (b badAreas) ReadAt(p []byte, off int64) (int, error) {
+	for _, a := range b.bad {
+		if off < a[1] && off+int64(len(p)) > a[0] {
+			return 0, errors.New("I/O error (test bad area)")
+		}
+	}
+	return b.r.ReadAt(p, off)
 }
 
 // Validate checks a found file (deleted or carved) is complete. It decodes untrusted data, so it
@@ -498,13 +550,15 @@ func (s *Service) Validate(a ValidateArgs, r *ValidateReply) (err error) {
 	if dev == nil {
 		return errors.New("not opened as a raw device")
 	}
-	src := source.ExtentReader{Dev: dev, Off: a.VolOff, Extents: a.Extents}
+	spy := &failSpy{r: dev}
+	src := source.ExtentReader{Dev: spy, Off: a.VolOff, Extents: a.Extents}
 	if r.OK, r.Why = validate.Check(a.Ext, src, a.Size); r.OK {
 		note := r.Why
 		if r.OK, r.Why = carve.Verify(a.Ext, src, a.Size); r.OK { // the structure walks to its end
 			r.Why = note
 		}
 	}
+	r.ReadFailed = spy.failed.Load()
 	return nil
 }
 

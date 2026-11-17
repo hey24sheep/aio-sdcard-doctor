@@ -17,7 +17,7 @@ func (d *exfatDriver) deleted(ctx context.Context, emit func(source.Deleted) err
 		if !e.IsDeleted() || !e.IsFile() || e.IsDir() {
 			return nil
 		}
-		del := source.Deleted{Path: strings.TrimPrefix(p, "/"), Size: int64(e.Size()), MTime: e.ModifiedTime(), State: "metadata-damaged"}
+		del := source.Deleted{Path: strings.TrimPrefix(p, "/"), Size: int64(e.Size()), MTime: exfatTime(e), State: "metadata-damaged"}
 		fc := e.FirstCluster()
 		if del.Size == 0 || fc < 2 || e.NameChecksumMismatch() {
 			return emit(del)

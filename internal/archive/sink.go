@@ -8,6 +8,7 @@ import (
 	"io"
 	"time"
 
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/salvage"
 )
 
@@ -39,4 +40,11 @@ func extOf(p string) string {
 		}
 	}
 	return ""
+}
+
+// CleanTemps removes what a stopped or crashed run left under root, in either mode (a run in
+// the other mode would never look for them): only our own temp names.
+func CleanTemps(out destfs.FS, root string) {
+	cleanZipTemps(out, root)
+	cleanFolderTemps(out, root)
 }

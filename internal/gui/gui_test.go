@@ -246,7 +246,7 @@ func TestViewAndDo(t *testing.T) {
 	}
 	json.NewDecoder(resp.Body).Decode(&v)
 	resp.Body.Close()
-	if v.View.Step != app.StepAction || v.View.Card == nil || v.Theme["signal"][0] != "#1F4FD1" {
+	if v.View.Step != app.StepAction || v.View.Card == nil || v.Theme["signal"][0] != "#2347D6" {
 		t.Fatalf("view %+v theme %v", v.View.Step, v.Theme["signal"])
 	}
 	// a refused command comes back as 422 with the message to show

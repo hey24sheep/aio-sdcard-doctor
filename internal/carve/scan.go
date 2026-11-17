@@ -80,6 +80,12 @@ func Scan(ctx context.Context, r io.ReaderAt, size int64, opt Options, from int6
 	for i, f := range fs {
 		index[f.Name] = i
 	}
+	for _, h := range opt.Found { // as set below when the scan passed them
+		i, ok := index[h.Format]
+		if ok && h.Offset < p && (!h.Complete || fs[i].HeaderSized) {
+			suppress[i] = max(suppress[i], h.Offset+h.Size)
+		}
+	}
 	for p < size {
 		if p >= nextCP {
 			if checkpoint != nil {

@@ -104,3 +104,24 @@ func TestCellNeutralizesFormulas(t *testing.T) {
 		t.Error("an ordinary name changed")
 	}
 }
+
+// SC6d: a file counted, then taken back (turned FAILED when its ZIP part failed) kept its header
+// line in the summary.
+func TestSummaryRemoveTakesBackHeaderLine(t *testing.T) {
+	var s Summary
+	e := manifest.Entry{Source: "DCIM/x.jpg", Status: manifest.OK, Header: "mismatch"}
+	s.Add(e)
+	s.Remove(e)
+	if strings.Contains(s.String(), "DCIM/x.jpg") {
+		t.Fatalf("header line kept:\n%s", s.String())
+	}
+}
+
+// OC11a: files kept from an earlier run (outside this choice) are shown as kept, not counted as
+// excluded.
+func TestSummaryShowsKeptFromEarlierRun(t *testing.T) {
+	s := Summary{Kept: 3}
+	if !strings.Contains(s.String(), "Kept from an earlier run") || !strings.Contains(s.String(), "3") {
+		t.Fatalf("kept count missing:\n%s", s.String())
+	}
+}

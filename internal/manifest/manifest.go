@@ -61,6 +61,9 @@ type Manifest struct {
 	Version    int
 	Volume     drives.Identity
 	SourceKind string
+	// SourceRoot is the source exactly as the user gave it (folder, drive root, device or image),
+	// so a later Format can tell whether the rescue copied the whole card or one folder of it.
+	SourceRoot string
 	Profiles   []string
 	Excluded   []string
 	// The user's choice for this destination, offered again on the next run.
@@ -114,13 +117,7 @@ func (m *Manifest) Count() (int, error) {
 // ExportJSON writes manifest.json atomically (the spec's report file).
 func (m *Manifest) ExportJSON(out destfs.FS, path string) error {
 	var buf bytes.Buffer
-	head, err := json.Marshal(struct {
-		Version    int
-		Volume     drives.Identity
-		SourceKind string
-		Profiles   []string
-		Excluded   []string
-	}{m.Version, m.Volume, m.SourceKind, m.Profiles, m.Excluded})
+	head, err := json.Marshal(*m) // every exported metadata field, so Rebuild restores them all
 	if err != nil {
 		return err
 	}

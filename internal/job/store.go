@@ -154,3 +154,52 @@ func ClearBucket(s *Store, bucket string) (err error) {
 		return tx.DeleteBucket([]byte(bucket))
 	})
 }
+
+// Batch collects writes and stores them in one fsync'd transaction on Flush: a deep scan's
+// finds are written at its checkpoint, together with the position they come before.
+type Batch struct {
+	s    *Store
+	puts []batched
+}
+
+type batched struct {
+	bucket, key string
+	val         []byte
+}
+
+// NewBatch starts an empty batch for s.
+func NewBatch(s *Store) *Batch { return &Batch{s: s} }
+
+// BatchPut adds bucket/key = v (as JSON) to the batch.
+func BatchPut[T any](b *Batch, bucket, key string, v T) error {
+	raw, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	b.puts = append(b.puts, batched{bucket, key, raw})
+	return nil
+}
+
+// Flush stores the batch's writes in one transaction and empties it.
+func (b *Batch) Flush() (err error) {
+	defer guard(&err)
+	if len(b.puts) == 0 {
+		return nil
+	}
+	err = b.s.db.Update(func(tx *bolt.Tx) error {
+		for _, p := range b.puts {
+			bk, err := tx.CreateBucketIfNotExists([]byte(p.bucket))
+			if err != nil {
+				return err
+			}
+			if err := bk.Put([]byte(p.key), p.val); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		b.puts = b.puts[:0]
+	}
+	return err
+}

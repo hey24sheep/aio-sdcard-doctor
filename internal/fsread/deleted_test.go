@@ -103,7 +103,7 @@ func osDelete(t *testing.T, img []byte, g fatGeom, short string) int64 {
 	t.Helper()
 	e := entry(t, img, short)
 	for k := 32; ; k += 32 { // long-name records just before it
-		start := len(img) - cap(e) - k // offset of the record k bytes before e
+		start := cap(img) - cap(e) - k // offset of the record k bytes before e (e is a slice of img; cap, not len: ReadFile can over-allocate)
 		if start < 0 || img[start+11] != 0x0F {
 			break
 		}

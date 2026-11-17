@@ -207,3 +207,64 @@ func FuzzPlanStaysInside(f *testing.F) {
 		}
 	})
 }
+
+// A card file named like another file's __PARTIAL copy gets the suffix, so a partial copy can
+// never land on it.
+func TestPlannerReservesPartialNames(t *testing.T) {
+	p := NewPlanner(`D:\out`, MaxPath)
+	p.Add(profile.Photos, "DCIM/foo__PARTIAL.jpg")
+	p.Add(profile.Photos, "DCIM/foo.jpg")
+	if got := p.Plan(profile.Photos, "DCIM/foo.jpg"); got != "Photos/DCIM/foo.jpg" {
+		t.Fatalf("foo.jpg: %s", got)
+	}
+	if got := p.Plan(profile.Photos, "DCIM/foo__PARTIAL.jpg"); strings.EqualFold(got, "Photos/DCIM/foo__PARTIAL.jpg") {
+		t.Fatalf("foo__PARTIAL.jpg keeps the name foo.jpg's partial copy gets: %s", got)
+	}
+}
+
+// A destination an earlier run recorded stays its file's, whichever files this run lists.
+func TestPlannerKeepsClaimedNames(t *testing.T) {
+	p := NewPlanner(`D:\out`, MaxPath)
+	p.Claim("Documents/notes/a.txt", "notes/a.txt")
+	p.Add(profile.Documents, "notes/A.TXT")
+	p.Add(profile.Documents, "notes/a.txt")
+	if got := p.Plan(profile.Documents, "notes/a.txt"); got != "Documents/notes/a.txt" {
+		t.Fatalf("a.txt moved to %s", got)
+	}
+	if got := p.Plan(profile.Documents, "notes/A.TXT"); strings.EqualFold(got, "Documents/notes/a.txt") {
+		t.Fatalf("A.TXT planned onto a.txt's copy: %s", got)
+	}
+}
+
+// M2: names were made safe for the system the program runs on, not for the destination: from
+// Linux or macOS, a card name with ':' failed on a FAT, exFAT or NTFS disk every run.
+func TestPlannerUsesWindowsRulesForWindowsFileSystems(t *testing.T) {
+	p := NewPlanner("/mnt/out", MaxPath)
+	p.Windows = true
+	if got := p.Plan(profile.Photos, `DCIM/a:b?.jpg`); got != "Photos/DCIM/a_b_.jpg" {
+		t.Errorf("got %s", got)
+	}
+	if got := p.Plan(profile.Documents, `docs/CON.txt`); got != "Documents/docs/_CON.txt" {
+		t.Errorf("got %s", got)
+	}
+}
+
+// SC3: an earlier run's partial copy a__PARTIAL.jpg is that file's even when a.jpg isn't on the
+// card this run: a card file literally named a__PARTIAL.jpg is planned elsewhere.
+func TestPlannerKeepsClaimedPartialName(t *testing.T) {
+	p := NewPlanner(`D:\out`, MaxPath)
+	p.Claim("Photos/DCIM/a.jpg", "DCIM/a.jpg")
+	if got := p.Plan(profile.Photos, "DCIM/a__PARTIAL.jpg"); strings.EqualFold(got, "Photos/DCIM/a__PARTIAL.jpg") {
+		t.Fatalf("planned onto a.jpg's partial copy: %s", got)
+	}
+	// a file that claimed the literal name itself keeps it
+	p = NewPlanner(`D:\out`, MaxPath)
+	p.Claim("Photos/DCIM/a.jpg", "DCIM/a.jpg")
+	p.Claim("Photos/DCIM/a__PARTIAL.jpg", "DCIM/a__PARTIAL.jpg")
+	if got := p.Plan(profile.Photos, "DCIM/a__PARTIAL.jpg"); got != "Photos/DCIM/a__PARTIAL.jpg" {
+		t.Fatalf("own claim lost: %s", got)
+	}
+	if got := p.Plan(profile.Photos, "DCIM/a.jpg"); got != "Photos/DCIM/a.jpg" {
+		t.Fatalf("a.jpg moved: %s", got)
+	}
+}

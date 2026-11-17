@@ -307,3 +307,30 @@ func TestAPKSigningBlockAccepted(t *testing.T) {
 		t.Fatalf("APK with a signing block: %s", why)
 	}
 }
+
+// Adversarial pass 2 OR2: a deleted ZIP written with data descriptors (sizes after the data)
+// whose tail was overwritten walked on to the next ZIP's records and was reported as one
+// complete ZIP covering both, with a photo between them hidden inside it.
+func TestDeletedZipDoesNotSwallowItsNeighbours(t *testing.T) {
+	vol := make([]byte, 1<<20)
+	h := make([]byte, 30) // one local header: data descriptor flag, sizes 0, deflate
+	copy(h, "PK\x03\x04")
+	h[4], h[6], h[8], h[26] = 20, 8, 8, 5
+	copy(vol, h)
+	copy(vol[30:], "a.txt")
+	copy(vol[35:], bytes.Repeat([]byte{0x55}, 2000)) // the start of its data; the rest overwritten
+	jpg, zb := genJPEG(t), genZIP(t)
+	copy(vol[8192:], jpg)
+	copy(vol[65536:], zb)
+	hits := scanAll(t, vol, Options{})
+	for _, p := range []placed{{off: 8192, data: jpg, ext: "jpg"}, {off: 65536, data: zb, ext: "docx"}} {
+		if !findHit(hits, p) {
+			t.Errorf("%s at %d not found whole; hits %+v", p.ext, p.off, hits)
+		}
+	}
+	for _, x := range hits {
+		if x.Offset == 0 && x.Complete {
+			t.Errorf("the broken zip is reported complete: %+v", x)
+		}
+	}
+}

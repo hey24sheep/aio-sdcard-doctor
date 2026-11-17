@@ -187,6 +187,11 @@ func identify(r io.ReaderAt, off, size int64) Volume {
 	if len(boot) > sector {
 		boot = boot[:sector]
 	}
+	if fsBoot(boot) == "" {
+		if c, _ := backupBoot(io.NewSectionReader(r, off, size)); c != nil {
+			boot = c[:sector]
+		}
+	}
 	switch k := fsBoot(boot); {
 	case k == "exfat" && len(boot) >= 104:
 		v.FS, v.Serial = k, serial32(boot[100:])
@@ -214,6 +219,21 @@ func identify(r io.ReaderAt, off, size int64) Volume {
 		v.FS = "hfs+"
 	}
 	return v
+}
+
+// backupBoot finds the copy FAT32 keeps of its boot sectors (at sector 6) or exFAT of its boot
+// region (at sector 12), for a volume whose own boot sector is unreadable or wiped. It returns
+// the copy, to stand in for the volume's first sectors, and the file system it is for.
+func backupBoot(r io.ReaderAt) ([]byte, string) {
+	for _, bps := range []int64{512, 1024, 2048, 4096} {
+		if b := readAt(r, 12*bps, 12*int(bps)); len(b) == 12*int(bps) && has(b, 3, "EXFAT   ") && int64(1)<<b[108] == bps {
+			return b, "exfat"
+		}
+		if b := readAt(r, 6*bps, 3*int(bps)); len(b) == 3*int(bps) && fatKind(b) == "fat32" && int64(le.Uint16(b[11:])) == bps {
+			return b, "fat32"
+		}
+	}
+	return nil, ""
 }
 
 func serial32(b []byte) string {

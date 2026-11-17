@@ -142,7 +142,45 @@ func apkSigBlock(x *rd, pos int64) (int64, bool) {
 	return n, true
 }
 
+// descriptorEnd checks that a data descriptor ends the data that starts at data, where the
+// record found at q (signature pat) says it does, and returns where the next record starts.
+func descriptorEnd(x *rd, data, q int64, pat []byte) (int64, bool) {
+	c := q - data
+	if string(pat) == "PK\x07\x08" {
+		d, err := x.bytes(q, 16)
+		if err != nil {
+			return 0, false
+		}
+		d64, err64 := x.bytes(q, 24)
+		zip64 := err64 == nil && int64(le64(d64[8:])) == c // ZIP64: 8-byte sizes
+		if le32(d[8:]) == c {
+			if nx, err := x.bytes(q+16, 2); !zip64 || err != nil || string(nx) == "PK" {
+				return q + 16, true
+			}
+		}
+		if zip64 {
+			return q + 24, true
+		}
+		return 0, false
+	}
+	// a descriptor without its signature, right before the next record: CRC and sizes
+	if c >= 12 {
+		if d, err := x.bytes(q-12, 12); err == nil && le32(d[4:]) == c-12 {
+			return q, true
+		}
+	}
+	if c >= 20 {
+		if d, err := x.bytes(q-20, 20); err == nil && int64(le64(d[4:])) == c-20 {
+			return q, true
+		}
+	}
+	return 0, false
+}
+
 var zipMethods = map[int64]bool{0: true, 1: true, 6: true, 8: true, 9: true, 12: true, 14: true, 93: true, 95: true, 98: true, 99: true}
+
+// maxStray bounds the data-descriptor signatures a ZIP entry's data may hold by chance.
+const maxStray = 64
 
 // zipWalk walks local headers, the central directory and the end record; entry receives the
 // first entries' names (with their data offset, method and stored size).
@@ -186,16 +224,33 @@ func zipWalk(x *rd, entry func(name string, data, method, csize int64)) (int64, 
 			}
 			files++
 			if flags&8 != 0 && (csize == 0 || csize == 0xFFFFFFFF) || csize == 0xFFFFFFFF {
-				q, pat, err := x.find(data, x.limit, []byte("PK\x07\x08"), []byte("PK\x03\x04"), []byte("PK\x01\x02"))
-				if err != nil {
-					return 0, err
-				}
-				pos = q
-				if string(pat) == "PK\x07\x08" {
-					pos = q + 16
-					if nx, err := x.bytes(q+16, 2); err == nil && string(nx) != "PK" {
-						pos = q + 24 // ZIP64 descriptor
+				// the size is only in a data descriptor after the data: take the first one whose
+				// size fits. A signature that doesn't fit is in the data by chance, or belongs to
+				// whatever overwrote this zip's tail (another zip: it must not be swallowed).
+				from, stray := data, int64(-1)
+				for tries := 0; ; tries++ {
+					q, pat, err := x.find(from, x.limit, []byte("PK\x07\x08"), []byte("PK\x03\x04"), []byte("PK\x01\x02"))
+					if err != nil {
+						if stray >= 0 && (errors.Is(err, errTrunc) || errors.Is(err, errSteps)) {
+							x.seen = stray // incomplete, up to the first record that isn't its own
+						}
+						return 0, err
 					}
+					if end, ok := descriptorEnd(x, data, q, pat); ok {
+						pos = end
+						break
+					}
+					if stray < 0 {
+						stray = q
+					}
+					// a header that doesn't end this entry's data starts the next record: the
+					// descriptor is gone (each later record tried would cost a read). A descriptor
+					// signature in the data by chance is passed over, a few times.
+					if string(pat) != "PK\x07\x08" || tries >= maxStray {
+						x.seen = stray
+						return 0, errTrunc
+					}
+					from = q + 1
 				}
 				continue
 			}

@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"slices"
 	"strings"
 
@@ -8,6 +9,7 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/fsread"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/recovery"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/rescue"
 )
 
 // ActionRow is one thing the user can do with a card.
@@ -98,6 +100,9 @@ func actionsFor(d drives.Drive) []ActionRow {
 			a.Enabled, a.Reason = false, "This is already an image — copy files from it instead"
 		case a.Name == "fix" && d.System:
 			a.Enabled, a.Reason = false, "This is your system disk"
+		case d.FS == KindNotResponding && (a.Name == "rescue" || a.Name == "scan" || a.Name == "fix"):
+			a.Enabled, a.Reason = false, "This drive didn't answer when it was listed — unplug it and plug it in again, "+
+				"or read the card itself (full backup image, find deleted files)"
 		}
 		out[i] = a
 	}
@@ -120,14 +125,27 @@ type NextStep struct {
 	Why    string `json:"why"`
 }
 
-func nextSteps(req Request, res job.Result) []NextStep {
+// enabled reports whether the named action can be chosen.
+func enabled(rows []ActionRow, name string) bool {
+	return slices.ContainsFunc(rows, func(a ActionRow) bool { return a.Name == name && a.Enabled })
+}
+
+func nextSteps(req Request, res job.Result, err error) []NextStep {
 	switch req.Action {
 	case "rescue":
+		if errors.Is(err, rescue.ErrImageInstead) {
+			return []NextStep{{Action: "image", Label: "Make a full backup image",
+				Why: "You chose this instead of copying file by file: the card is read once, end to end, then you copy files from the image"}}
+		}
 		return []NextStep{{Action: "verify", Label: "Check the copy", Why: "Confirms every copied file matches what was read from the card"}}
 	case "scan":
 		return []NextStep{{Action: "rescue", Label: "Copy files off the card", Why: "Now that you've seen what's there"}}
 	case "image":
-		return []NextStep{{Action: "rescue", Label: "Copy files from the image", Why: "The card can rest; the image holds everything"}}
+		// only a finished image file can be copied from: a stopped one has gaps, and with Compress
+		// card.img is removed once the .xz is checked
+		if err == nil && isFile(req.Dest) {
+			return []NextStep{{Action: "rescue", Label: "Copy files from the image", Why: "The card can rest; the image holds everything"}}
+		}
 	case "recover":
 		return []NextStep{{Action: "scan", Label: "See what's on the card", Why: "Check what else is still there"}}
 	}
@@ -273,7 +291,8 @@ type View struct {
 	Recover      *RecoverView    `json:"recover,omitempty"`
 	RunLabel     string          `json:"runLabel,omitempty"`
 	Admin        bool            `json:"admin"`
-	CanStartOver bool            `json:"canStartOver"` // an earlier run can be continued; the user may start over instead
+	CanStartOver bool            `json:"canStartOver"`           // an earlier run can be continued; the user may start over instead
+	ImageInstead bool            `json:"imageInstead,omitempty"` // the copy stopped because the person chose a full backup image instead
 }
 
 // View is a snapshot of the session.
@@ -290,7 +309,10 @@ func (s *Session) View() View {
 	defer s.mu.Unlock()
 	v := View{Step: s.step, Busy: s.busy, Error: s.err, Req: s.req, Choices: s.choices, Plan: s.plan,
 		Instruction: s.instr, Progress: s.progress, Result: s.result, Next: s.next, Admin: s.deps.IsAdmin(),
-		Tools: s.tools, Undelete: s.undelete}
+		Tools: s.tools, Undelete: s.undelete, ImageInstead: s.imgInstead}
+	if v.Error == "" && s.step == StepDrive {
+		v.Error = s.listErr
+	}
 	v.Steps = append([]Step{StepDrive, StepAction}, flow[s.req.Action]...)
 	if s.req.Action != "" {
 		v.Steps = append(v.Steps, StepRun, StepResults)
@@ -325,3 +347,6 @@ func (s *Session) View() View {
 	v.Recover = s.rec.view()
 	return v
 }
+
+// KindNotResponding is the file system of a drive that didn't answer when listed.
+const KindNotResponding = "not responding"

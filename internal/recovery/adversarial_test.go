@@ -1,11 +1,22 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/fsread"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/manifest"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/worker"
 )
 
 // rawCard writes an unreadable card (no file system) of size bytes with a photo at off.
@@ -66,5 +77,97 @@ func TestSelectDeepPicksWithoutDeepFlag(t *testing.T) {
 	os.WriteFile(sel, []byte("State;Name;Path;Size;Modified;Comment;ID\nExcellent;a.jpg;a.jpg;1;x;;D:a.jpg\n"), 0o644)
 	if got, _ := ReadSelection(sel); len(got) != 1 || got[0] != "D:a.jpg" {
 		t.Fatalf("';' list read as %q", got)
+	}
+}
+
+// Adversarial pass 2 SR2: two deleted files whose assumed runs overlap were both "Excellent",
+// though the space can hold only one of them. Two records of the same data aren't a conflict.
+func TestDeletedFilesSharingSpaceArePoor(t *testing.T) {
+	rows := []Row{
+		{Kind: "deleted", Path: "a.jpg", Extents: [][2]int64{{4096, 6000}}, internal: "recoverable"},
+		{Kind: "deleted", Path: "b.jpg", Extents: [][2]int64{{8192, 3000}}, internal: "recoverable"},
+		{Kind: "deleted", Path: "c.jpg", Extents: [][2]int64{{20480, 100}}, internal: "recoverable"},
+		{Kind: "deleted", Path: "d.jpg", Extents: [][2]int64{{20480, 100}}, internal: "recoverable"}, // same data as c
+	}
+	for i := range rows {
+		rows[i].State, rows[i].Comment = mapState(rows[i].internal)
+	}
+	sharedSpace(rows)
+	for i, want := range []string{Poor, Poor, Excellent, Excellent} {
+		if rows[i].State != want {
+			t.Errorf("%s: %s %q, want %s", rows[i].Path, rows[i].State, rows[i].Comment, want)
+		}
+	}
+	if !strings.Contains(rows[0].Comment, "another deleted file") {
+		t.Errorf("comment %q", rows[0].Comment)
+	}
+}
+
+// twoVolumes is a card with two readable volumes of 4 MiB each.
+type twoVolumes struct{ fakeSrc }
+
+func (f *twoVolumes) ReadError() string { return "" }
+func (f *twoVolumes) Volumes() []fsread.Volume {
+	return []fsread.Volume{{Offset: 0, Size: 4 << 20, FS: "fat32"}, {Offset: 4 << 20, Size: 4 << 20, FS: "fat32"}}
+}
+
+// Adversarial pass 2 SR5: recovering --volume 1 into the folder that holds --volume 0's
+// recovery counted volume 1's finds as already copied (same keys, same places).
+func TestOtherVolumeIntoSameFolderRefused(t *testing.T) {
+	img := make([]byte, 8<<20)
+	copy(img[1<<20:], realJPEG(t, 300, 200, 5))
+	copy(img[5<<20:], realJPEG(t, 300, 200, 6)) // the same place in volume 1
+	dst := filepath.Join(t.TempDir(), "out")
+	from := filepath.Join(t.TempDir(), "card.img")
+	os.WriteFile(from, nil, 0o644)
+	open := func(worker.Spec, time.Duration) (Source, error) {
+		return &twoVolumes{fakeSrc{dev: bytes.NewReader(img), size: int64(len(img))}}, nil
+	}
+	run(t, &Recover{From: from, Dest: dst, Deep: true, OpenSource: open})
+	r := &Recover{From: from, Dest: dst, Deep: true, Volume: 1, OpenSource: open}
+	defer r.Close()
+	if p := plan(t, r); !blocked(p, "dest-other-volume") {
+		t.Fatalf("issues %+v", p.Issues)
+	}
+}
+
+// failLater reads fine until fail is set, then fails reads touching [from, to).
+type failLater struct {
+	r        io.ReaderAt
+	fail     *atomic.Bool
+	from, to int64
+}
+
+func (f failLater) ReadAt(p []byte, off int64) (int, error) {
+	if f.fail.Load() && off < f.to && off+int64(len(p)) > f.from {
+		return 0, errors.New("I/O error")
+	}
+	return f.r.ReadAt(p, off)
+}
+
+// Adversarial pass 2 M5: a find that can't be read any more when it is recovered was reported
+// as a corrupt file ("truncated or corrupt jpeg"), not as unreadable.
+func TestUnreadableFindSaysSo(t *testing.T) {
+	img := make([]byte, 8<<20)
+	jpg := realJPEG(t, 300, 200, 7)
+	copy(img[1<<20:], jpg)
+	var fail atomic.Bool
+	dev := failLater{r: bytes.NewReader(img), fail: &fail, from: 1<<20 + 4096, to: 1<<20 + 8192}
+	dst := filepath.Join(t.TempDir(), "out")
+	r := &Recover{From: filepath.Join(t.TempDir(), "card.img"), Dest: dst, Deep: true,
+		OpenSource: func(worker.Spec, time.Duration) (Source, error) {
+			return &fakeSrc{dev: dev, size: int64(len(img))}, nil
+		}}
+	os.WriteFile(r.From, nil, 0o644)
+	defer r.Close()
+	p := plan(t, r)
+	e := env()
+	e.Progress = func(p job.Progress) { fail.Store(p.Phase == "Recovering") } // the card got worse
+	if _, err := r.Run(context.Background(), e, p); err != nil {
+		t.Fatal(err)
+	}
+	got := entries(t, dst)["carved@1048576"]
+	if got.Status != manifest.CARVED_DAMAGED || !strings.Contains(got.Error, "4096 bytes could not be read") {
+		t.Fatalf("entry %+v (all %v)", got, entries(t, dst))
 	}
 }

@@ -8,7 +8,7 @@ import "testing"
 // double-click too, and must open the GUI rather than print usage to nowhere.
 func TestStartedByDoubleClick(t *testing.T) {
 	for n, want := range map[int]bool{0: true, 1: true, 2: false, 3: false} {
-		if got := startedByDoubleClick(n); got != want {
+		if got := startedByDoubleClick(n, outConsole); got != want {
 			t.Errorf("%d console processes: %v, want %v", n, got, want)
 		}
 	}

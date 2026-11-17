@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 
 	"github.com/spf13/cobra"
 
@@ -13,17 +14,37 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/tui"
 )
 
-// launchMode decides what running the program with no command opens: double-clicked (it owns a
-// fresh console window) → the GUI; typed in a terminal → the TUI; --plain or a script → the
-// drive list and usage.
+// launchMode decides what running the program with no command opens: --plain → the drive list
+// and usage, always (a script or a screen reader asked for it); double-clicked (it owns a fresh
+// console window) → the GUI; typed in a terminal → the TUI; a script → the drive list and usage.
 func launchMode(doubleClick, tty, plain bool) string {
 	switch {
+	case plain:
+		return "usage"
 	case doubleClick:
 		return "gui"
 	case tty && !plain:
 		return "tui"
 	}
 	return "usage"
+}
+
+// outKind is where standard output goes.
+type outKind int
+
+const (
+	outNone    outKind = iota // no output at all (the windowed build)
+	outConsole                // a console window
+	outPipe                   // another program reads it
+	outFile                   // > file
+	outOther                  // NUL, a serial port …
+)
+
+// startedByDoubleClick: Explorer gives the program a console of its own (no shell in it) whose
+// output is that console — or, for the windowed build, no console and no output at all. Output
+// going to a pipe or a file is a script, whatever its console looks like (a hidden one, none).
+func startedByDoubleClick(consoleProcesses int, out outKind) bool {
+	return consoleProcesses <= 1 && (out == outConsole || out == outNone)
 }
 
 // Seams (tests never start a real front end).
@@ -47,11 +68,15 @@ func guiLockDir() string {
 }
 
 // startGUI reopens a running GUI of this user if there is one (a closed window mid-job), else
-// starts one. Ctrl+C in the console stops it.
+// starts one. Ctrl+C in the console stops it. --port doesn't start a second one beside it: the
+// running one holds the job and the card.
 func startGUI(ctx context.Context, io IO, noOpen bool, port int) error {
 	lock := guiLockDir()
-	if url, ok := gui.Reopen(lock, isAdmin()); ok && port == 0 {
+	if url, ok := reopenGUI(lock, isAdmin()); ok {
 		fmt.Fprintf(io.Out, "SD card doctor is already running — reopened at %s\n", url)
+		if port != 0 {
+			fmt.Fprintf(io.Out, "--port %d was ignored: the window that is already running keeps its own port.\n", port)
+		}
 		if !noOpen {
 			if err := openWindow(url); err != nil {
 				fmt.Fprintf(io.Err, "Couldn't open a window (%v) — open the link above in your browser.\n", err)
@@ -68,6 +93,9 @@ func startGUI(ctx context.Context, io IO, noOpen bool, port int) error {
 	url := srv.URL()
 	fmt.Fprintf(io.Out, "SD card doctor is open at %s\n", url)
 	fmt.Fprintln(io.Out, "That link works once, on this computer only. Close this window (or press Ctrl+C) to quit.")
+	if isAdmin() && runtime.GOOS == "linux" { // Chrome and Chromium refuse to run as root: no window, no error
+		fmt.Fprintln(io.Out, "Running as root: if no window opens, open the link above in your own browser.")
+	}
 	if !noOpen {
 		if err := openWindow(url); err != nil {
 			fmt.Fprintf(io.Err, "Couldn't open a window (%v) — open the link above in your browser.\n", err)

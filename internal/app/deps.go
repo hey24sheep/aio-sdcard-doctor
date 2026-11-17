@@ -106,6 +106,7 @@ func Choices(ctx context.Context, from string) ([]ChoiceRow, error) {
 		return nil, err
 	}
 	defer src.Close()
+	src.SetContext(ctx) // Back or Stop ends a read the card is stuck on
 	inv, err := scan.Scan(ctx, src, profile.Detect(src))
 	if err != nil {
 		return nil, err
@@ -151,8 +152,12 @@ func NewAction(r Request) (job.Action, error) {
 		}
 		exe, _ := os.Executable()
 		bin, _ := drives.Lookup(exe)
-		return &fixAction{Fix: &fix.Fix{Op: r.FixOp, Target: t, NewLabel: r.NewLabel, Replug: true, NewTest: r.Fresh, BinaryDisk: bin.PhysicalID},
-			from: r.From}, nil
+		verified := false
+		if r.Manifest != "" { // the rescue verified in this window: counted only if it is of this card
+			verified, _ = verifiedRescueFn(r.Manifest, t)
+		}
+		return &fixAction{Fix: &fix.Fix{Op: r.FixOp, Target: t, NewLabel: r.NewLabel, Replug: true, NewTest: r.Fresh, BinaryDisk: bin.PhysicalID,
+			Verified: verified}, from: r.From, fp: fingerprint(t)}, nil
 	}
 	return nil, fmt.Errorf("unknown action %q", r.Action)
 }
@@ -190,6 +195,7 @@ func FixTarget(from string) (fix.Target, error) {
 type fixAction struct {
 	*fix.Fix
 	from string
+	fp   string // what is on a card with no file-system serial, read when the check was made
 }
 
 func (f *fixAction) ConfirmText() (string, string) {
@@ -200,6 +206,21 @@ func (f *fixAction) Confirm(label, size string) error { return fix.Confirm(f.Tar
 
 // fixTargetFn is a seam (tests use a made-up card).
 var fixTargetFn = FixTarget
+
+// diskFingerprintFn is a seam (tests never open a device).
+var diskFingerprintFn = fix.DiskFingerprint
+
+// verifiedRescueFn is a seam (tests make up the verified rescue).
+var verifiedRescueFn = fix.VerifiedRescue
+
+// fingerprint is what is on the card's first sectors, for a card whose file system has no serial
+// to tell it from another of the same size (no volume, a RAW one, a reader that reports none).
+func fingerprint(t fix.Target) string {
+	if p := fix.FingerprintPath(t); p != "" {
+		return diskFingerprintFn(p)
+	}
+	return ""
+}
 
 // logWriter turns an OS tool's output into log lines the front ends show.
 type logWriter struct {
@@ -234,7 +255,8 @@ func (f *fixAction) Run(ctx context.Context, env job.Env, p job.Plan) (job.Resul
 	}
 	now, err := fixTargetFn(f.from)
 	if err != nil || now.Disk.Path != f.Target.Disk.Path || now.Disk.Serial != f.Target.Disk.Serial ||
-		now.Disk.Size != f.Target.Disk.Size || now.Vol.ID.FSSerial != f.Target.Vol.ID.FSSerial {
+		now.Disk.Size != f.Target.Disk.Size || now.Vol.ID.FSSerial != f.Target.Vol.ID.FSSerial ||
+		fingerprint(now) != f.fp { // a blank card of the same size swapped into the same reader
 		return job.Result{}, errors.New("the card changed since you confirmed (unplugged or swapped) — nothing was done")
 	}
 	return f.Fix.Run(ctx, env, p)
@@ -262,6 +284,7 @@ func (s *scanAction) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 }
 
 func (s *scanAction) Run(ctx context.Context, env job.Env, _ job.Plan) (job.Result, error) {
+	s.src.SetContext(ctx) // Stop ends a read the card is stuck on, not only the listing
 	inv, err := scan.Scan(ctx, s.src, profile.Detect(s.src))
 	if err != nil {
 		return job.Result{}, err

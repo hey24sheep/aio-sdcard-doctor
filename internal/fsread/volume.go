@@ -19,12 +19,20 @@ import (
 // ErrMountWithOS: the volume's format has no built-in parser (APFS, HFS+, encrypted, unknown).
 var ErrMountWithOS = errors.New("not readable by built-in parsers — mount with the OS")
 
+// ErrPartialFolder: part of a folder's records could not be read (a bad sector, or blank where an
+// image holds an area the card couldn't give). ReadDir returns it (in an *fs.PathError naming the
+// folder) together with every entry that could be read, so fs.WalkDir reports the folder and
+// still walks those entries; scan records the folder as not fully listed.
+var ErrPartialFolder = errors.New("part of this folder could not be read, so some of its files may be missing from this list")
+
 // node is one directory entry as a driver reports it (live entries only, no "." / "..").
 type node struct {
 	name  string
 	size  int64
 	mtime time.Time
 	dir   bool
+	orig  string // a name the folder holds twice: the record's real name (name is made unique)
+	nth   int    // and which of the records with that name this is (0 = the first)
 }
 
 // driver is what each parser adapter implements; dir is "." for the root.
@@ -39,16 +47,17 @@ const maxCached = 500_000
 // vol turns a driver into a source.Source. Every parser call is guarded: a panic inside a
 // third-party library becomes an error (the worker adds a second, process-level guard).
 type vol struct {
-	drv    driver
-	kind   string
-	id     drives.Identity
-	mu     sync.Mutex
-	cache  map[string][]node
-	cached int
+	drv     driver
+	kind    string
+	id      drives.Identity
+	mu      sync.Mutex
+	cache   map[string][]node
+	partial map[string]error // folders listed only in part (ErrPartialFolder)
+	cached  int
 }
 
 func newVol(d driver, kind string, v Volume) *vol {
-	return &vol{drv: d, kind: kind, cache: map[string][]node{},
+	return &vol{drv: d, kind: kind, cache: map[string][]node{}, partial: map[string]error{},
 		id: drives.Identity{FSSerial: v.Serial, Label: v.Label}}
 }
 
@@ -62,23 +71,61 @@ func (v *vol) Kind() string                   { return v.kind }
 func (v *vol) Identity() drives.Identity      { return v.id }
 func (v *vol) setIdentity(id drives.Identity) { v.id = id }
 
+// list lists dir. With ErrPartialFolder (part of the folder couldn't be read) the entries that
+// could be read come with it, and both are kept.
 func (v *vol) list(dir string) (ns []node, err error) {
 	defer guard(&err)
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if ns, ok := v.cache[dir]; ok {
-		return ns, nil
+		return ns, v.partial[dir]
+	}
+	if strings.Count(dir, "/") >= maxDepth { // only a folder pointing back up the tree goes this deep
+		return nil, errTooDeep
 	}
 	ns, err = v.drv.list(dir)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrPartialFolder) {
 		return nil, err
 	}
+	sameNames(ns)
 	if v.cached+len(ns) > maxCached {
-		v.cache, v.cached = map[string][]node{}, 0
+		v.cache, v.partial, v.cached = map[string][]node{}, map[string]error{}, 0
 	}
 	v.cache[dir] = ns
+	if err != nil {
+		v.partial[dir] = err
+	}
 	v.cached += len(ns)
-	return ns, nil
+	return ns, err
+}
+
+// sameNames gives every record after the first with a name the folder already holds (damage
+// chkdsk reports as duplicate names) a name of its own, "A (2).TXT", and keeps the real name and
+// which record it is, so each is listed once and opened as itself.
+func sameNames(ns []node) {
+	names := make(map[string]int, len(ns)) // name → records seen with it so far
+	for _, n := range ns {
+		names[n.name] = 0
+	}
+	for i := range ns {
+		k := names[ns[i].name]
+		names[ns[i].name] = k + 1
+		if k == 0 {
+			continue
+		}
+		orig, ext := ns[i].name, path.Ext(ns[i].name)
+		if ns[i].dir {
+			ext = ""
+		}
+		for j := k + 1; ; j++ {
+			name := fmt.Sprintf("%s (%d)%s", strings.TrimSuffix(orig, ext), j, ext)
+			if _, taken := names[name]; !taken {
+				ns[i].name, ns[i].orig, ns[i].nth = name, orig, k
+				names[name] = 1
+				break
+			}
+		}
+	}
 }
 
 func (v *vol) find(name string) (node, error) {
@@ -89,7 +136,7 @@ func (v *vol) find(name string) (node, error) {
 		return node{name: ".", dir: true}, nil
 	}
 	ns, err := v.list(path.Dir(name))
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrPartialFolder) { // a name read from a partial folder is found
 		return node{}, &fs.PathError{Op: "stat", Path: name, Err: err}
 	}
 	base := path.Base(name)
@@ -116,12 +163,15 @@ func (v *vol) ReadDir(name string) ([]fs.DirEntry, error) {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: errors.New("not a directory")}
 	}
 	ns, err := v.list(name)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrPartialFolder) {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
 	}
 	out := make([]fs.DirEntry, len(ns))
 	for i := range ns {
 		out[i] = info(ns[i])
+	}
+	if err != nil { // the readable entries and the error: fs.WalkDir reports it, then walks them
+		return out, &fs.PathError{Op: "readdir", Path: name, Err: err}
 	}
 	return out, nil
 }
@@ -260,7 +310,14 @@ func (v *vol) LiveExtents(ctx context.Context, emit func(path string, off, n int
 // Open returns a read-only source for a volume found by Probe.
 func Open(r io.ReaderAt, v Volume) (src source.Source, err error) {
 	defer guard(&err)
-	sec := io.NewSectionReader(r, v.Offset, v.Size)
+	var sec io.ReaderAt = io.NewSectionReader(r, v.Offset, v.Size)
+	if v.FS == "fat32" || v.FS == "exfat" {
+		if fsBoot(readAt(sec, 0, sector)) != v.FS { // the boot sector is unreadable or wiped
+			if c, k := backupBoot(sec); k == v.FS {
+				sec = bootCopy{sec, c}
+			}
+		}
+	}
 	var d driver
 	switch v.FS {
 	case "fat12", "fat16", "fat32":
@@ -280,6 +337,25 @@ func Open(r io.ReaderAt, v Volume) (src source.Source, err error) {
 		return nil, fmt.Errorf("%s: %w", v.FS, err)
 	}
 	return newVol(d, v.FS, v), nil
+}
+
+// bootCopy reads r with the backup copy b of the boot sectors in place of the volume's first
+// sectors (FAT32 and exFAT keep one; the parsers read only the first).
+type bootCopy struct {
+	r io.ReaderAt
+	b []byte
+}
+
+func (c bootCopy) ReadAt(p []byte, off int64) (int, error) {
+	if off >= int64(len(c.b)) {
+		return c.r.ReadAt(p, off)
+	}
+	n := copy(p, c.b[off:])
+	if n == len(p) {
+		return n, nil
+	}
+	m, err := c.r.ReadAt(p[n:], int64(len(c.b)))
+	return n + m, err
 }
 
 // SetIdentity lets the worker attach the device identity (model, serial, size) to a source.

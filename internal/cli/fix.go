@@ -2,12 +2,10 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -43,9 +41,10 @@ var probeVolume = func(dev string) (fsread.Volume, bool) {
 
 // describeUnmounted fills in what the boot sector says about an unmounted volume: its label (so
 // Format keeps it, and it is what you type to confirm), file system and serial (so a rescue of
-// this card can vouch for it).
+// this card can vouch for it). udev may already have given the serial (a card with no partition
+// table listed as its own volume), but not the file system.
 func describeUnmounted(t *fix.Target) {
-	if t.Vol.Root != "" || t.Vol.Device == "" || t.Vol.ID.FSSerial != "" {
+	if t.Vol.Root != "" || t.Vol.Device == "" || t.Vol.ID.FSSerial != "" && t.Vol.FS != "" && t.Vol.Label != "" {
 		return
 	}
 	v, ok := probeVolume(t.Vol.Device)
@@ -58,7 +57,10 @@ func describeUnmounted(t *fix.Target) {
 	if t.Vol.FS == "" {
 		t.Vol.FS = v.FS
 	}
-	t.Vol.ID.FSSerial, t.Vol.ID.Label = v.Serial, t.Vol.Label
+	if t.Vol.ID.FSSerial == "" {
+		t.Vol.ID.FSSerial = v.Serial
+	}
+	t.Vol.ID.Label = t.Vol.Label
 }
 
 // sameRoot: p names the volume root (case-insensitive, trailing separators ignored).
@@ -107,48 +109,9 @@ func findTarget(drive string) (fix.Target, error) {
 	return fix.Target{}, fmt.Errorf("couldn't find the disk %s is on — try again as administrator, or name the disk", drive)
 }
 
-// verifiedRescue: the manifest is of this card and its last verify said ALL FILES MATCH.
-func verifiedRescue(manifestPath string, t fix.Target) (bool, string) {
-	if manifestPath == "" {
-		return false, ""
-	}
-	b, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return false, "can't read " + manifestPath
-	}
-	var m struct {
-		Volume  drives.Identity
-		Entries []struct{ Status string }
-	}
-	if json.Unmarshal(b, &m) != nil {
-		return false, manifestPath + " is not a rescue manifest"
-	}
-	left := 0
-	for _, e := range m.Entries {
-		switch e.Status {
-		case "FAILED", "PARTIAL", "STALLED", "LOCKED", "UNREADABLE":
-			left++
-		}
-	}
-	if left > 0 {
-		return false, fmt.Sprintf("that rescue couldn't read %d files or folders — they may still be only on the card", left)
-	}
-	if t.Vol.ID.FSSerial == "" && len(t.Vol.ID.Fingerprint) == 0 {
-		return false, "this card has no readable identity (no file-system serial), so no rescue can be matched to it"
-	}
-	if ok, _, _ := m.Volume.Matches(t.Vol.ID); !ok {
-		return false, "that rescue is of a different card"
-	}
-	sums, _ := filepath.Glob(filepath.Join(filepath.Dir(manifestPath), "verify_summary_*.txt"))
-	sort.Strings(sums)
-	if len(sums) == 0 {
-		return false, "that rescue was never verified — run verify first"
-	}
-	if s, _ := os.ReadFile(sums[len(sums)-1]); !strings.Contains(string(s), "ALL FILES MATCH") {
-		return false, "the last verify of that rescue found problems"
-	}
-	return true, ""
-}
+// verifiedRescue: the manifest is a rescue of this whole card and its last verify said ALL
+// FILES MATCH (the rule every front end uses lives in fix).
+var verifiedRescue = fix.VerifiedRescue
 
 func fixCmd(io IO, g *globals) *cobra.Command {
 	var drive, man, label, confirmLabel, confirmSize string
@@ -182,6 +145,7 @@ func fixCmd(io IO, g *globals) *cobra.Command {
 			if err != nil {
 				return exit(ExitError, "fix: %v", err)
 			}
+			fp := fingerprint(t) // what is on a card with no volume, to notice a swap before writing
 			verified, why := verifiedRescue(man, t)
 			if why != "" {
 				fmt.Fprintf(io.Err, "Note: %s\n", why)
@@ -202,7 +166,7 @@ func fixCmd(io IO, g *globals) *cobra.Command {
 				// user was reading or typing is never touched
 				now, err := findTarget(drive)
 				describeUnmounted(&now)
-				if err != nil || !sameCard(t, now) {
+				if err != nil || !sameCard(t, now) || fingerprint(now) != fp {
 					return exit(ExitError, "The card changed since you confirmed (unplugged or swapped) — nothing was done. Run the command again.")
 				}
 				return nil
@@ -245,7 +209,7 @@ func sameCard(a, b fix.Target) bool {
 // typedConfirm asks for (or checks) the label and size, exactly as shown.
 func typedConfirm(ctx context.Context, io IO, t fix.Target, label, size string) error {
 	if io.TTY {
-		fmt.Fprintf(io.Err, "\nThis erases or changes the card. To go on, type its label (%s) and size (%s).\n", fix.ConfirmLabel(t), fix.SizeText(t))
+		fmt.Fprintf(io.Err, "\nThis erases or changes the card. To go on, type its label (%s) and size (%s).\n", cleanText(fix.ConfirmLabel(t)), cleanText(fix.SizeText(t)))
 		var err error
 		if label, err = ask(ctx, io, "Label: "); err != nil {
 			return err // no answer: nothing was changed (exit 2, or 130 for Ctrl+C)
@@ -258,4 +222,17 @@ func typedConfirm(ctx context.Context, io IO, t fix.Target, label, size string) 
 		return exit(ExitError, "%v — nothing was changed.", err)
 	}
 	return nil
+}
+
+// diskFingerprint tells a card with no partition from another of the same size put in the same
+// reader (a seam: tests never open a device).
+var diskFingerprint = fix.DiskFingerprint
+
+// fingerprint is taken for a card without a file-system serial (a RAW volume, or no volume at
+// all): what is on it tells it from another card of the same size swapped into the reader.
+func fingerprint(t fix.Target) string {
+	if p := fix.FingerprintPath(t); p != "" {
+		return diskFingerprint(p)
+	}
+	return ""
 }

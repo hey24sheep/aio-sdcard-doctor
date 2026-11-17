@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -293,5 +294,109 @@ func TestVerifyImageReadsTheNamedXZ(t *testing.T) {
 	res, _ := v.Run(context.Background(), job.Env{}, job.Plan{})
 	if res.Counters["OK"] == 1 {
 		t.Fatal("the broken .xz passed: the raw image was checked instead")
+	}
+}
+
+// Adversarial pass 2 SR1: a report with no copied files was verified as "ALL FILES MATCH - the
+// copy is a perfect copy", clean.
+func TestVerifyNothingToCheckIsBlocked(t *testing.T) {
+	d := t.TempDir()
+	mf := filepath.Join(d, "Reports", "manifest.json")
+	os.MkdirAll(filepath.Dir(mf), 0o755)
+	os.WriteFile(mf, []byte(`{"Entries":[{"Source":"a.jpg","Status":"FAILED","Bytes":5},{"Source":"b.jpg","Status":"FAILED"}]}`), 0o644)
+	v := &Verify{Manifest: mf, LookupDrive: ntfs}
+	p, err := v.Plan(context.Background(), job.Env{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked := false
+	for _, is := range p.Issues {
+		blocked = blocked || is.Severity == job.Block && strings.Contains(is.Title, "nothing to check")
+	}
+	if !blocked {
+		t.Fatalf("not refused: %+v", p.Issues)
+	}
+	if res, _ := v.Run(context.Background(), job.Env{}, p); res.Clean {
+		t.Fatal("verifying nothing reported clean")
+	}
+}
+
+// SR1: files the rescue couldn't copy aren't in the check, so the copy can't be called perfect.
+func TestVerifyCountsFilesThatWereNotCopied(t *testing.T) {
+	root := rescueFolder(t) // its report lists one EXCLUDED file
+	mf := filepath.Join(root, "Reports", "manifest.json")
+	_, p, err := do(t, &Verify{Manifest: mf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := summary(t, filepath.Join(root, "Reports"))
+	if strings.Contains(s, "perfect copy") || !strings.Contains(s, "1 entry in the report was not copied") {
+		t.Fatalf("summary:\n%s", s)
+	}
+	if !strings.Contains(strings.Join(p.Summary, "\n"), "not copied") {
+		t.Fatalf("plan: %q", p.Summary)
+	}
+}
+
+// Adversarial pass 2 OR5: a half-done verify of card A resumed on card B (same drive letter)
+// counted A's files as checked, and called the mix one perfect copy.
+func TestVerifyResumeOnAnotherCardStartsOver(t *testing.T) {
+	root := rescueFolder(t)
+	mf := filepath.Join(root, "Reports", "manifest.json")
+	serial := "AAAA-0001"
+	look := func(string) (drives.Drive, error) {
+		return drives.Drive{FS: "NTFS", ID: drives.Identity{FSSerial: serial}}, nil
+	}
+	v := &Verify{Manifest: mf, LookupDrive: look}
+	p, err := v.Plan(context.Background(), job.Env{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// card A: interrupted after its first file (Documents/Docs/empty.txt) was checked OK
+	ctx, cancel := context.WithCancel(context.Background())
+	n := 0
+	v.Run(ctx, job.Env{Progress: func(job.Progress) {
+		if n++; n == 1 {
+			cancel()
+		}
+	}}, p)
+	cancel()
+	serial = "BBBB-0002" // card B at the same place: that file isn't on it
+	os.Remove(filepath.Join(root, "Documents", "Docs", "empty.txt"))
+	res, p2, err := do(t, &Verify{Manifest: mf, LookupDrive: look})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p2.Resume != nil || res.Counters["MISSING"] != 1 || res.Clean {
+		t.Fatalf("resumed on another card: resume %+v counters %v", p2.Resume, res.Counters)
+	}
+}
+
+// OR5: the target was pulled during a check and a different card came back in its place.
+func TestVerifyStopsWhenAnotherCardComesBack(t *testing.T) {
+	root := rescueFolder(t)
+	var mu sync.Mutex
+	serial := "AAAA-0001"
+	look := func(string) (drives.Drive, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return drives.Drive{FS: "NTFS", ID: drives.Identity{FSSerial: serial}}, nil
+	}
+	v := &Verify{Manifest: filepath.Join(root, "Reports", "manifest.json"), Reports: t.TempDir(), LookupDrive: look, WaitTimeout: 10 * time.Second}
+	p, err := v.Plan(context.Background(), job.Env{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.RemoveAll(root) // pulled
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		mu.Lock()
+		serial = "BBBB-0002"
+		mu.Unlock()
+		os.MkdirAll(root, 0o755) // another card at the same place
+	}()
+	res, err := v.Run(context.Background(), job.Env{Prompt: job.AutoPrompter{}}, p)
+	if err == nil || !strings.Contains(err.Error(), "different card") || res.Clean {
+		t.Fatalf("err %v counters %v", err, res.Counters)
 	}
 }

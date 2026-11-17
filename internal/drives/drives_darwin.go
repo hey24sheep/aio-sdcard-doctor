@@ -2,6 +2,8 @@ package drives
 
 import (
 	"context"
+	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -57,9 +59,31 @@ func List() ([]Drive, error) {
 			Removable:      info.boolean("RemovableMedia") || info.boolean("Ejectable") && !info.boolean("Internal")}
 		d.ID = Identity{PhysicalID: whole, Model: info.str("MediaName"), Size: uint64(info.num("TotalSize")),
 			FSSerial: info.str("VolumeUUID"), Label: d.Label}
+		if fs := strings.ToLower(d.FS); fs == "msdos" || fs == "exfat" {
+			// the boot sector's serial, as Windows and a raw read of this card report it (OA11);
+			// readable as root only (as raw reads are), else the UUID macOS derives stays
+			if s, ok, _ := probeWithin("boot:"+from, probeTimeout, func() (string, bool) { return readBootSerial(from) }); ok {
+				d.ID.FSSerial = s
+			}
+		}
 		out = append(out, d)
 	}
 	return out, nil
+}
+
+// readBootSerial reads a volume's first sector, read-only, for its serial.
+func readBootSerial(dev string) (string, bool) {
+	f, err := os.Open(dev)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	b := make([]byte, 512)
+	if _, err := io.ReadFull(f, b); err != nil {
+		return "", false
+	}
+	s := bootSectorSerial(b)
+	return s, s != ""
 }
 
 // ListDevices returns whole disks from `diskutil list`, including unmounted ones.

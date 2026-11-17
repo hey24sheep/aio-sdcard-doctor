@@ -25,14 +25,16 @@ type fixRig struct {
 
 func mockCard(t *testing.T) *fixRig {
 	rig := &fixRig{
-		vol:  drives.Drive{Root: `Q:\`, Label: "CAMERA", FS: "exFAT", Total: 64 << 30, Removable: true, PhysicalID: "MOCK7", Device: "/dev/mock1"},
-		disk: drives.Device{Path: `\\.\MOCK7`, Model: "SD Reader", Bus: "usb", Size: 64 << 30, Removable: true, PhysicalID: "MOCK7"},
+		vol: drives.Drive{Root: `Q:\`, Label: "CAMERA", FS: "exFAT", Total: 64 << 30, Removable: true, PhysicalID: "MOCK7-cli", Device: "/dev/mock1",
+			ID: drives.Identity{FSSerial: "1234-ABCD"}}, // a card with a file system has its serial
+		disk: drives.Device{Path: `\\.\MOCK7`, Model: "SD Reader", Bus: "usb", Size: 64 << 30, Removable: true, PhysicalID: "MOCK7-cli"},
 	}
 	rig.disk.Volumes = []drives.Drive{rig.vol}
-	oldLookup, oldList, oldExec, oldAdmin, oldGOOS := lookupDrive, listDevicesFn, fix.Exec, isAdmin, fixGOOS
+	oldLookup, oldList, oldExec, oldAdmin, oldGOOS, oldFP := lookupDrive, listDevicesFn, fix.Exec, isAdmin, fixGOOS, diskFingerprint
 	t.Cleanup(func() {
-		lookupDrive, listDevicesFn, fix.Exec, isAdmin, fixGOOS = oldLookup, oldList, oldExec, oldAdmin, oldGOOS
+		lookupDrive, listDevicesFn, fix.Exec, isAdmin, fixGOOS, diskFingerprint = oldLookup, oldList, oldExec, oldAdmin, oldGOOS, oldFP
 	})
+	diskFingerprint = func(dev string) string { panic("test reached a real device: " + dev) }
 	lookupDrive = func(p string) (drives.Drive, error) {
 		// off Windows "Q:" is a relative path, which the CLI makes absolute before the lookup
 		if strings.EqualFold(strings.TrimRight(p, `\/`), "Q:") || p == normFrom("Q:") {
@@ -84,7 +86,7 @@ func TestFixNotVerifiedNeedsYes(t *testing.T) {
 
 func TestFixRefusesSystemDisk(t *testing.T) {
 	rig := mockCard(t)
-	rig.disk.Volumes = append(rig.disk.Volumes, drives.Drive{Root: `C:\`, System: true, PhysicalID: "MOCK7"})
+	rig.disk.Volumes = append(rig.disk.Volumes, drives.Drive{Root: `C:\`, System: true, PhysicalID: "MOCK7-cli"})
 	code, _, errOut := cli(t, false, "", "fix", "--drive", "Q:", "--format", "--yes", "--confirm-label", "CAMERA", "--confirm-size", "64.0 GB")
 	if code == 0 || len(rig.ran) != 0 || !strings.Contains(errOut, "system") {
 		t.Fatalf("exit %d ran %v: %s", code, rig.ran, errOut)
@@ -146,13 +148,13 @@ func TestFixHealthOnImage(t *testing.T) {
 func TestVerifiedNeedsIdentity(t *testing.T) {
 	dir := t.TempDir()
 	man := filepath.Join(dir, "manifest.json")
-	os.WriteFile(man, []byte(`{"Volume":{"FSSerial":"AAAA-1111","Size":34359738368}}`), 0o644)
+	os.WriteFile(man, []byte(`{"Volume":{"FSSerial":"AAAA-1111","Size":34359738368},"SourceRoot":"Q:\\"}`), 0o644)
 	os.WriteFile(filepath.Join(dir, "verify_summary_20261110_000000_000.txt"), []byte("ALL FILES MATCH - the copy is a perfect copy.\n"), 0o644)
 	var tg fix.Target // a RAW card: no file-system serial, nothing to match
 	if ok, why := verifiedRescue(man, tg); ok || !strings.Contains(why, "identity") {
 		t.Fatalf("ok %v why %q", ok, why)
 	}
-	tg.Vol.ID = drives.Identity{FSSerial: "AAAA-1111", Size: 34359738368}
+	tg.Vol.Root, tg.Vol.ID = `Q:\`, drives.Identity{FSSerial: "AAAA-1111", Size: 34359738368}
 	if ok, why := verifiedRescue(man, tg); !ok {
 		t.Fatalf("same card: %q", why)
 	}

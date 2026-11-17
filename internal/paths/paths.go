@@ -48,8 +48,9 @@ func short(t string, n int) string {
 	return t
 }
 
-// sanitizeSeg makes one path segment safe on every destination (R1).
-func sanitizeSeg(seg string) string {
+// sanitize makes one path segment safe on every destination (R1), with Windows' name rules when
+// win is set.
+func sanitize(seg string, win bool) string {
 	if seg == "." || seg == ".." {
 		return "_"
 	}
@@ -58,7 +59,7 @@ func sanitizeSeg(seg string) string {
 		switch {
 		case r == '/' || r == '\\' || r < 0x20 || r == utf8.RuneError:
 			b.WriteByte('_')
-		case windowsNames && strings.ContainsRune(`<>:"|?*`, r):
+		case win && strings.ContainsRune(`<>:"|?*`, r):
 			b.WriteByte('_')
 		default:
 			b.WriteRune(r)
@@ -68,7 +69,7 @@ func sanitizeSeg(seg string) string {
 	if s == "" {
 		return "_"
 	}
-	if windowsNames && reserved[strings.ToUpper(strings.TrimRight(strings.SplitN(s, ".", 2)[0], " "))] {
+	if win && reserved[strings.ToUpper(strings.TrimRight(strings.SplitN(s, ".", 2)[0], " "))] {
 		s = "_" + s
 	}
 	return s
@@ -85,10 +86,12 @@ var reserved = func() map[string]bool {
 }()
 
 // clean sanitises every segment of a "/"-separated relative path.
-func clean(rel string) string {
+func clean(rel string) string { return cleanAs(rel, windowsNames) }
+
+func cleanAs(rel string, win bool) string {
 	segs := strings.Split(rel, "/")
 	for i, s := range segs {
-		segs[i] = sanitizeSeg(s)
+		segs[i] = sanitize(s, win)
 	}
 	return strings.Join(segs, "/")
 }
@@ -163,19 +166,40 @@ func finish(rel string) string {
 
 // Planner assigns every file of an inventory a unique destination path "<Category>/<rel>".
 // Add every file first, then call Plan: the result does not depend on the order files were seen.
+// Claim the destinations earlier runs recorded first, so a name never moves to another file.
 type Planner struct {
 	base   string
 	max    int
 	groups map[string][]string // collision key → original rels (sorted)
 	keyOf  map[string]string   // cat + "\x00" + rel → key
+	alias  map[string]string   // collision key of a file's __PARTIAL name → that file
+	claims map[string]string   // folded destination an earlier run stored a file at → that file
+	pclaim map[string]string   // folded __PARTIAL name of a claimed destination → that file
+	own    map[string]string   // cat + "\x00" + rel → the destination it claimed
+	// Windows applies Windows' name rules (reserved characters, device names) whatever system
+	// this runs on: set it for a FAT, exFAT or NTFS destination.
+	Windows bool
 }
+
+func (p *Planner) clean(rel string) string { return cleanAs(rel, windowsNames || p.Windows) }
 
 // NewPlanner plans paths under base (the destination root) with the given length cap.
 func NewPlanner(base string, max int) *Planner {
-	return &Planner{base: base, max: max, groups: map[string][]string{}, keyOf: map[string]string{}}
+	return &Planner{base: base, max: max, groups: map[string][]string{}, keyOf: map[string]string{},
+		alias: map[string]string{}, claims: map[string]string{}, pclaim: map[string]string{}, own: map[string]string{}}
 }
 
 func id(cat profile.Category, rel string) string { return string(cat) + "\x00" + rel }
+
+// fold is how a destination compares on a case-insensitive, normalising file system.
+func fold(p string) string { return strings.ToLower(norm.NFC.String(p)) }
+
+// partialName is p with __PARTIAL before the extension (the name a copy with unreadable parts
+// gets; the same rule as archive.PartialName).
+func partialName(p string) string {
+	e := path.Ext(p)
+	return strings.TrimSuffix(p, e) + "__PARTIAL" + e
+}
 
 // Add registers a file. Collisions are keyed on the sanitised, NFC-normalised, lowercased path.
 func (p *Planner) Add(cat profile.Category, rel string) {
@@ -183,24 +207,73 @@ func (p *Planner) Add(cat profile.Category, rel string) {
 	if _, ok := p.keyOf[k]; ok {
 		return
 	}
-	key := strings.ToLower(norm.NFC.String(string(cat) + "/" + clean(rel)))
+	key := fold(string(cat) + "/" + p.clean(rel))
 	p.keyOf[k] = key
 	g := append(p.groups[key], rel)
 	sort.Strings(g)
 	p.groups[key] = g
+	ak := fold(string(cat) + "/" + partialName(p.clean(rel)))
+	if a, ok := p.alias[ak]; !ok || rel < a {
+		p.alias[ak] = rel
+	}
 }
 
-// Plan returns "<Category>/<safe rel>" for a file. The byte-smallest of colliding names keeps
-// the plain name; the others get "~<4 hex of the original name>" before the extension.
+// Claim reserves dest ("<Category>/<path>", as Plan returned it in an earlier run) for the card
+// file rel, whose copy an earlier run stored there: rel keeps that destination and no other file
+// is planned onto it, whichever files this run lists or selects.
+func (p *Planner) Claim(dest, rel string) {
+	cat, _, ok := strings.Cut(dest, "/")
+	if !ok {
+		return
+	}
+	// The claimed file's copy may be its __PARTIAL name (or become it): no other file takes that
+	// name either, even when the claimed file isn't on the card this run.
+	if pk := fold(partialName(dest)); p.pclaim[pk] == "" || rel < p.pclaim[pk] {
+		p.pclaim[pk] = rel
+	}
+	k := fold(dest)
+	if o, ok := p.claims[k]; ok {
+		if o <= rel {
+			return // two rows naming one copy (left by an older version): the smaller name keeps it
+		}
+		delete(p.own, id(profile.Category(cat), o))
+	}
+	p.claims[k] = rel
+	p.own[id(profile.Category(cat), rel)] = dest
+}
+
+// Plan returns "<Category>/<safe rel>" for a file. A file keeps the destination it claimed; the
+// byte-smallest of colliding names keeps the plain name; the others — and a file whose plain
+// name, or whose __PARTIAL name, is another file's — get "~<4 hex of the original name>" before
+// the extension.
 func (p *Planner) Plan(cat profile.Category, rel string) string {
 	p.Add(cat, rel)
-	name := clean(rel)
-	if g := p.groups[p.keyOf[id(cat, rel)]]; len(g) > 1 && g[0] != rel {
-		h := sha1.Sum([]byte(rel))
-		dir, file := path.Split(name)
-		e := ext(file)
-		name = dir + strings.TrimSuffix(file, e) + "~" + hex.EncodeToString(h[:])[:4] + e
+	if d, ok := p.own[id(cat, rel)]; ok {
+		return d
 	}
+	name := p.clean(rel)
+	key := p.keyOf[id(cat, rel)]
 	catBase := p.base + string(filepath.Separator) + string(cat)
+	plain := string(cat) + "/" + SafeRel(catBase, name, p.max)
+	g := p.groups[key]
+	hashed := len(g) > 1 && g[0] != rel
+	if a, ok := p.alias[key]; ok && a != rel {
+		hashed = true // a card file literally named like another file's __PARTIAL copy
+	}
+	for _, d := range []string{plain, partialName(plain)} {
+		if o, ok := p.claims[fold(d)]; ok && o != rel {
+			hashed = true // an earlier run stored another file there
+		}
+		if o, ok := p.pclaim[fold(d)]; ok && o != rel {
+			hashed = true // another file's partial copy is (or may be) there
+		}
+	}
+	if !hashed {
+		return plain
+	}
+	h := sha1.Sum([]byte(rel))
+	dir, file := path.Split(name)
+	e := ext(file)
+	name = dir + strings.TrimSuffix(file, e) + "~" + hex.EncodeToString(h[:])[:4] + e
 	return string(cat) + "/" + SafeRel(catBase, name, p.max)
 }

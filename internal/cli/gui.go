@@ -10,6 +10,7 @@ import (
 // Seams: tests never open a real window.
 var (
 	openWindow = gui.OpenAppWindow
+	reopenGUI  = gui.Reopen
 	appDeps    = app.ProductionDeps
 )
 

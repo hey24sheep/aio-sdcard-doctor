@@ -5,17 +5,25 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>SD card doctor</title>
+<link rel="icon" href="/assets/mark.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/assets/styles.css">
 <script type="module" src="/assets/app.js"></script>
 </head>
 <body>
 <a class="skip" href="#main">Skip to the current step</a>
-<header class="cardbar" id="cardbar">
-  <div class="brand">SD card doctor</div>
+<header class="appbar" id="cardbar">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 24 30" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <path class="body" d="M3 0h12l9 9v19a2 2 0 0 1-2 2H2a2 2 0 0 1-2-2V3a3 3 0 0 1 3-3z"/>
+      <rect class="pin" x="4" y="3" width="2.4" height="6" rx=".6"/><rect class="pin" x="8.2" y="3" width="2.4" height="6" rx=".6"/>
+      <rect class="pin" x="12.4" y="3" width="2.4" height="6" rx=".6"/>
+    </svg>
+    SD card doctor
+  </div>
   <div class="card-id" id="card-id">No card chosen</div>
-  <button type="button" class="theme" id="theme" aria-label="Colour theme: automatic">Theme</button>
+  <button type="button" class="theme ghost" id="theme" aria-label="Colour theme: automatic">Theme</button>
 </header>
-<nav aria-label="Steps"><ol class="steps" id="steps"></ol></nav>
+<nav class="stepbar" aria-label="Steps"><ol class="steps" id="steps"></ol><div class="step-compact" id="step-compact" aria-hidden="true"></div></nav>
 <div class="layout">
   <main id="main" tabindex="-1"></main>
   <aside id="side" aria-label="Help for this step"></aside>

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"path"
 	"strings"
 	"sync"
 	"time"
@@ -30,14 +31,47 @@ type iofsReader interface {
 }
 
 // diskfsDriver adapts a go-diskfs file system (FAT, ISO9660) to driver.
+//
+// On FAT, go-diskfs follows cluster chains without a loop check (a looped chain allocates until
+// the worker is killed), ignores read errors inside files and folders, and refuses the whole
+// volume when FAT #1 is damaged. So our own parser (fatdel.go) checks every folder path first,
+// lists a folder itself when its chain is damaged or go-diskfs refused the volume, and reads
+// every file along its own loop-safe cluster runs.
 type diskfsDriver struct {
-	fsys      iofsReader
+	fsys      iofsReader  // nil: go-diskfs refused this FAT volume
 	localTime bool        // FAT stores local wall-clock time; go-diskfs labels it UTC
 	raw       io.ReaderAt // FAT only: deleted records and cluster runs are read from here
 	kind      string
+	lay       *fatLayout // FAT only: our own reading of the boot sector and the FAT
+	layErr    error
+
+	mu      sync.Mutex
+	folders map[string]fatFolder // folders read by our parser, by path (files are opened in any order)
+	kept    int                  // entries held in folders
 }
 
+type fatFolder struct {
+	es    []fatEntry
+	clean bool
+	err   error // ErrPartialFolder or nil
+}
+
+// maxKeptEntries bounds the folders resolve keeps (about 100 bytes an entry).
+const maxKeptEntries = 200_000
+
+// errDirLoop: a folder record points back at one of the folders above it (damage), which would
+// make the path DCIM/SUB/SUB/… endless.
+var errDirLoop = errors.New("this folder points back at a folder above it (damaged folder record)")
+
 func openFAT(r io.ReaderAt, size int64, kind string) (driver, error) {
+	d := &diskfsDriver{localTime: true, raw: r, kind: kind}
+	d.lay, d.layErr = readFATLayout(r, kind, size)
+	if errors.Is(d.layErr, errFATTooBig) {
+		return nil, d.layErr // go-diskfs would trust those sizes too
+	}
+	if d.layErr == nil && !d.lay.fat1 {
+		return d, nil // our table needed FAT #2, which go-diskfs never reads: list it ourselves
+	}
 	st := newStorage(r, size)
 	var f iofsReader
 	var err error
@@ -50,9 +84,13 @@ func openFAT(r io.ReaderAt, size int64, kind string) (driver, error) {
 		f, err = fat32.Read(st, size, 0, 512)
 	}
 	if err != nil {
-		return nil, err
+		if d.layErr != nil {
+			return nil, err
+		}
+		return d, nil // e.g. "fat tables did not match": our own parser lists and reads it
 	}
-	return &diskfsDriver{fsys: f, localTime: true, raw: r, kind: kind}, nil
+	d.fsys = f
+	return d, nil
 }
 
 // localTime reinterprets a wall-clock time labelled UTC in the local zone, like the OS does
@@ -65,6 +103,22 @@ func localTime(t time.Time) time.Time {
 }
 
 func (d *diskfsDriver) list(dir string) ([]node, error) {
+	var own []fatEntry // our own parser's reading of dir (FAT)
+	if l, err := d.layout(); err == nil {
+		es, clean, err := d.resolve(l, dir)
+		switch {
+		case errors.Is(err, ErrPartialFolder): // go-diskfs would list it short without a word
+			return liveNodes(es), err
+		case err == nil && (d.fsys == nil || !clean):
+			return liveNodes(es), nil
+		case err == nil:
+			own = es
+		case d.fsys == nil || !errors.Is(err, fs.ErrNotExist):
+			return nil, err
+		} // else a name on the way is spelled differently by go-diskfs (it ignores a long name's checksum)
+	} else if d.fsys == nil {
+		return nil, err
+	}
 	es, err := d.fsys.ReadDir(d.path(dir))
 	if err != nil {
 		return nil, err
@@ -84,9 +138,9 @@ func (d *diskfsDriver) list(dir string) ([]node, error) {
 			mt = localTime(mt)
 		}
 		n := node{name: e.Name(), size: fi.Size(), mtime: mt, dir: fi.IsDir()}
-		if strings.ContainsRune(n.name, utf8.RuneError) && d.raw != nil {
+		if strings.ContainsRune(n.name, utf8.RuneError) && own != nil {
 			if real == nil {
-				real = d.realEntries(dir)
+				real = bySpelling(own)
 			}
 			// names that differ only outside the BMP share go-diskfs's spelling: take our own
 			// entries in directory order, with their own sizes
@@ -103,16 +157,21 @@ func (d *diskfsDriver) open(name string, n node) (io.ReaderAt, io.Closer, error)
 	if n.size == 0 {
 		return emptyReader{}, nopCloser{}, nil
 	}
-	if d.raw != nil && diskfsName(name) != name { // go-diskfs can't tell such names apart: read the chain
-		l, err := d.layout()
-		if err != nil {
+	if l, err := d.layout(); err == nil { // FAT: read along our own cluster runs
+		es, _, err := d.resolve(l, path.Dir(name))
+		if err != nil && !errors.Is(err, ErrPartialFolder) && (d.fsys == nil || !errors.Is(err, fs.ErrNotExist)) {
 			return nil, nil, err
 		}
-		e, ok := l.lookup(name)
-		if !ok || e.dir {
+		base := path.Base(name)
+		if n.orig != "" { // a name the folder holds twice: open that record, not the first
+			base = n.orig
+		}
+		if e, ok := findLiveNth(es, base, n.nth); ok && !e.dir {
+			return chainReader(d.raw, l.extents(e), e.size), nopCloser{}, nil
+		}
+		if d.fsys == nil || diskfsName(name) != name || n.orig != "" { // go-diskfs can't tell such names apart
 			return nil, nil, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
 		}
-		return source.ExtentReader{Dev: d.raw, Extents: l.extents(e)}, nopCloser{}, nil
 	}
 	f, err := d.fsys.Open(d.path(name))
 	if err != nil {
@@ -163,25 +222,87 @@ func diskfsPath(p string) string {
 	return strings.Join(segs, "/")
 }
 
-// realEntries maps go-diskfs's spelling of each live name in dir to our own entries with that
-// spelling, in directory order (several when names differ only outside the BMP).
-func (d *diskfsDriver) realEntries(dir string) map[string][]fatEntry {
-	l, err := d.layout()
-	if err != nil {
-		return nil
-	}
-	raw, ok := l.dirRecords(dir)
-	if !ok {
-		return nil
-	}
+// bySpelling maps go-diskfs's spelling of each live name to our own entries with that spelling,
+// in directory order (several when names differ only outside the BMP).
+func bySpelling(es []fatEntry) map[string][]fatEntry {
 	m := map[string][]fatEntry{}
-	for _, e := range l.entries(raw) {
+	for _, e := range es {
 		if !e.deleted {
 			k := diskfsName(e.name)
 			m[k] = append(m[k], e)
 		}
 	}
 	return m
+}
+
+// liveNodes lists our own parser's live entries.
+func liveNodes(es []fatEntry) []node {
+	var out []node
+	for _, e := range es {
+		if e.deleted {
+			continue
+		}
+		mt := e.mtime
+		if mt.Year() < 1981 { // as localTime does for go-diskfs's times
+			mt = time.Time{}
+		}
+		out = append(out, node{name: e.name, size: e.size, mtime: mt, dir: e.dir})
+	}
+	return out
+}
+
+// resolve is fatLayout.resolve with the folders it read kept: re-reading a 10,000-photo folder
+// for every file opened in it would read 320 KB per file, and files copied in size order go back
+// and forth between folders.
+func (d *diskfsDriver) resolve(l *fatLayout, dir string) ([]fatEntry, bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if f, ok := d.folders[dir]; ok {
+		return f.es, f.clean, f.err
+	}
+	es, clean, err := l.resolve(dir)
+	if err != nil && !errors.Is(err, ErrPartialFolder) {
+		return nil, false, err
+	}
+	if d.folders == nil || d.kept+len(es) > maxKeptEntries {
+		d.folders, d.kept = map[string]fatFolder{}, 0
+	}
+	d.folders[dir] = fatFolder{es, clean, err}
+	d.kept += len(es)
+	return es, clean, err
+}
+
+// errShortChain: a live file's cluster chain ends before its size (a loop or a broken link).
+var errShortChain = errors.New("the rest of this file can't be found: its cluster chain in the FAT is damaged")
+
+// chainReader reads a live FAT file along its cluster runs. When the chain covers less than the
+// file's size, reading past it fails instead of giving a silently shorter file.
+func chainReader(dev io.ReaderAt, ext [][2]int64, size int64) io.ReaderAt {
+	r := source.ExtentReader{Dev: dev, Extents: ext}
+	var have int64
+	for _, x := range ext {
+		have += x[1]
+	}
+	if have >= size {
+		return r
+	}
+	return shortChain{r, have}
+}
+
+type shortChain struct {
+	r    io.ReaderAt
+	have int64
+}
+
+func (s shortChain) ReadAt(p []byte, off int64) (int, error) {
+	if off >= s.have {
+		return 0, errShortChain
+	}
+	n, err := s.r.ReadAt(p, off)
+	if errors.Is(err, io.EOF) {
+		err = errShortChain
+	}
+	return n, err
 }
 
 // seekReaderAt adapts a seekable file to io.ReaderAt (one reader at a time).
@@ -207,11 +328,18 @@ type emptyReader struct{}
 
 func (emptyReader) ReadAt([]byte, int64) (int, error) { return 0, io.EOF }
 
+// layout is our own reading of the FAT, read once per volume; each caller gets its own record of
+// the folders it has visited.
 func (d *diskfsDriver) layout() (*fatLayout, error) {
-	if d.raw == nil {
+	if d.lay == nil {
+		if d.layErr != nil {
+			return nil, d.layErr
+		}
 		return nil, errors.ErrUnsupported
 	}
-	return readFATLayout(d.raw, d.kind)
+	l := *d.lay
+	l.visitedDirs = map[uint32]bool{}
+	return &l, nil
 }
 
 func (d *diskfsDriver) deleted(ctx context.Context, emit func(source.Deleted) error) error {

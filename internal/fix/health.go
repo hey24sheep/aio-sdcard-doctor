@@ -44,6 +44,8 @@ type HealthOptions struct {
 var (
 	ErrDifferentCard = errors.New("this is not the card the test started on — put that card back, or start a new test with --new-test")
 	ErrStopped       = errors.New("stopped — run the same command again to continue the test")
+	// errNothingToCompare: every block the test wrote so far is in a bad area
+	errNothingToCompare = errors.New("nothing written by the test can be read back")
 )
 
 // healthCheckpoint: progress is saved this often (a variable for tests).
@@ -116,15 +118,6 @@ func union(rs []Range) []Range {
 	return out
 }
 
-func inBad(bad []Range, off int64) bool {
-	for _, r := range bad {
-		if off >= r.Off && off < r.Off+r.N {
-			return true
-		}
-	}
-	return false
-}
-
 // HealthTest writes a unique pattern over the whole card, then reads it back. Bad areas and a
 // card that wraps writes around (fake capacity) are reported. Progress is saved every
 // healthCheckpoint bytes; a resumed run first checks the card still holds its pattern (R2).
@@ -135,12 +128,23 @@ func HealthTest(ctx context.Context, rw RW, size int64, env job.Env, opt HealthO
 	}
 	defer st.Close()
 	s, ok, _ := job.Get[hstate](st, hBucket, "state")
+	if ok && s.Size == size && s.Phase != "done" && !opt.Restart {
+		switch err := recheck(rw, s); {
+		case errors.Is(err, errNothingToCompare):
+			// nothing the stopped test wrote can be read back to prove this is its card: start
+			// over rather than hand its bad areas to another card (OA13)
+			if env.Log != nil {
+				env.Log("info", "The stopped test can't be matched to this card (only bad areas so far): starting a new test.")
+			}
+			ok = false
+		case err != nil:
+			return Report{}, err
+		}
+	}
 	if !ok || s.Size != size || s.Phase == "done" || opt.Restart {
 		var seed [8]byte
 		rand.Read(seed[:])
 		s = hstate{Seed: binary.LittleEndian.Uint64(seed[:]) | 1, Size: size, Phase: "write"}
-	} else if err := recheck(rw, s); err != nil {
-		return Report{}, err
 	}
 	save := func() error { return job.Put(st, hBucket, "state", s) }
 	if err := save(); err != nil {
@@ -210,7 +214,7 @@ func HealthTest(ctx context.Context, rw RW, size int64, env job.Env, opt HealthO
 					return Report{}, err
 				}
 			}
-			if err := recheck(rw, s); err != nil {
+			if err := recheck(rw, s); err != nil && !errors.Is(err, errNothingToCompare) {
 				return Report{}, err
 			}
 		}
@@ -319,8 +323,23 @@ func recheck(rw RW, s hstate) error {
 		}
 		at = s.Pos - hBlock
 	}
-	if inBad(s.Bad, at) {
-		return nil
+	// a block in a bad area proves nothing (often block 0 on a worn card): check the nearest one
+	// that took the pattern instead, never skip the check
+	for moved := true; moved; {
+		moved = false
+		for _, r := range s.Bad {
+			if at >= r.Off && at < r.Off+r.N {
+				if s.Phase == "write" {
+					at = r.Off - hBlock // written before the bad area
+				} else {
+					at = r.Off + r.N
+				}
+				moved = true
+			}
+		}
+		if at < 0 || at >= s.Size {
+			return errNothingToCompare
+		}
 	}
 	b := alignedBuf(hBlock)[:min(hBlock, s.Size-at)] // unbuffered devices need an aligned buffer
 	if _, err := rw.ReadAt(b, at); err != nil && !errors.Is(err, io.EOF) {

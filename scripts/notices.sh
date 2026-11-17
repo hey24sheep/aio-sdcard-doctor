@@ -41,13 +41,15 @@ done
 		keep { body[name] = body[name] $0 "\n" }
 		END { for (i = 1; i <= n; i++) printf "%s", body[order[i]] }'
 	cat scripts/licenses/*.txt
-	# Apache-2.0 §4(d): a module's NOTICE file travels with it
+	# Apache-2.0 §4(d): a module's NOTICE file travels with it; so do extra licence files for code a
+	# module bundles (LICENSE.libyaml in Velocidex/yaml), which go-licenses doesn't pick up
 	for os in windows darwin linux; do
 		GOOS=$os go list -deps -f '{{with .Module}}{{.Path}} {{.Dir}}{{end}}' ./...
 	done | sort -u | while read -r path dir; do
-		for f in "$dir"/NOTICE*; do
+		for f in "$dir"/NOTICE* "$dir"/LICENSE.*; do
 			[ -f "$f" ] || continue
-			printf '================================================================\n%s (NOTICE)\n\n' "$path"
+			case "$(basename "$f")" in LICENSE.txt | LICENSE.md) continue ;; esac # go-licenses has these
+			printf '================================================================\n%s (%s)\n\n' "$path" "$(basename "$f")"
 			cat "$f"
 			echo
 		done

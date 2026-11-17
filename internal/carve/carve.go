@@ -56,6 +56,9 @@ type Options struct {
 	Formats []string   // format names to look for; empty = all
 	// Unreadable is told about every area that could not be read (and so was not searched).
 	Unreadable func(off, n int64)
+	// Found are the finds of the scan being resumed (Scan from > 0): one that reaches past the
+	// resume point keeps its format from being looked for again inside it, as in a whole scan.
+	Found []Hit
 }
 
 const (
@@ -154,7 +157,7 @@ func (x *rd) step() error {
 
 // find returns the offset of the first pat at or after from, searching up to stop (exclusive).
 func (x *rd) find(from, stop int64, pats ...[]byte) (int64, []byte, error) {
-	const chunk = 64 * 1024
+	const chunk = 60 * 1024 // with the overlap for a pattern across chunks, it fits bytes' cache
 	long := 0
 	for _, p := range pats {
 		long = max(long, len(p))

@@ -67,6 +67,7 @@ type zipSink struct {
 	st     *job.Store
 	open   map[string]*part
 	failed []string
+	used   map[string]int // the highest part number used per category in this run
 }
 
 // ZipSink stores files in <root>/<Category>-NNNN.zip parts (Deflate level 9, ZIP64 when needed).
@@ -74,15 +75,22 @@ type zipSink struct {
 // added; a part is written as .zip.tmp and only renamed — and its entries only reported as
 // stored — once it is closed and re-read successfully. A crash loses at most the open part.
 func ZipSink(out destfs.FS, root string, st *job.Store) Sink {
-	s := &zipSink{out: out, root: root, st: st, open: map[string]*part{}}
-	if es, err := os.ReadDir(root); err == nil {
-		for _, e := range es {
-			if strings.HasSuffix(e.Name(), ".zip.tmp") || e.Name() == spoolName {
-				out.Remove(filepath.Join(root, e.Name())) // ours: an unfinished part from a crash
-			}
+	cleanZipTemps(out, root)
+	return &zipSink{out: out, root: root, st: st, open: map[string]*part{}, used: map[string]int{}}
+}
+
+// cleanZipTemps removes unfinished parts and the spool file a crashed run left in root.
+func cleanZipTemps(out destfs.FS, root string) {
+	es, err := os.ReadDir(root)
+	if err != nil {
+		return
+	}
+	for _, e := range es {
+		n := e.Name()
+		if part, ok := strings.CutSuffix(n, ".tmp"); ok && partRe.MatchString(part) || n == spoolName {
+			out.Remove(filepath.Join(root, n)) // ours: an unfinished part from a crash
 		}
 	}
-	return s
 }
 
 // Failed lists stored names whose part failed verification (to be reported FAILED).
@@ -127,6 +135,60 @@ func (zp ZipParts) Stored(st *job.Store, root, dest string, size int64) bool {
 	return ok && n == uint64(size)
 }
 
+// EntryHasher hashes entries of the ZIP parts under root, opening each part once (rebuilding a
+// damaged store from the files on the destination).
+type EntryHasher struct {
+	root string
+	open map[string]*zip.ReadCloser
+}
+
+// NewEntryHasher reads the ZIP parts in root.
+func NewEntryHasher(root string) *EntryHasher {
+	return &EntryHasher{root: root, open: map[string]*zip.ReadCloser{}}
+}
+
+// Hash returns the uppercase hex SHA-256 and size of dest's entry ("Photos-0001.zip/DCIM/a.jpg").
+func (h *EntryHasher) Hash(dest string) (string, int64, error) {
+	part, name, ok := ZipPart(dest)
+	if !ok {
+		return "", 0, fmt.Errorf("%s: not in a ZIP part", dest)
+	}
+	zr := h.open[part]
+	if zr == nil {
+		var err error
+		if zr, err = zip.OpenReader(filepath.Join(h.root, part)); err != nil {
+			return "", 0, err
+		}
+		h.open[part] = zr
+	}
+	for _, f := range zr.File {
+		if f.Name != name {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return "", 0, err
+		}
+		defer rc.Close()
+		sh := sha256.New()
+		n, err := io.Copy(sh, rc)
+		return strings.ToUpper(fmt.Sprintf("%x", sh.Sum(nil))), n, err
+	}
+	return "", 0, fmt.Errorf("%s: not in %s", name, part)
+}
+
+// Close releases the parts.
+func (h *EntryHasher) Close() {
+	for _, zr := range h.open {
+		zr.Close()
+	}
+}
+
+// IndexEntry records dest as held by a verified, closed part (restoring a damaged store).
+func IndexEntry(st *job.Store, dest string, size int64) error {
+	return job.Put(st, indexBucket, dest, size)
+}
+
 func (s *zipSink) Has(dest string, size int64) bool {
 	v, ok, err := job.Get[int64](s.st, indexBucket, dest)
 	return err == nil && ok && v == size
@@ -134,11 +196,14 @@ func (s *zipSink) Has(dest string, size int64) bool {
 
 var partRe = regexp.MustCompile(`^(.+)-(\d{4,})\.zip$`)
 
+// nextNumber is one past every part of cat on the destination — a leftover .zip.tmp counted too,
+// it can't be created over — and every number used in this run: a part that failed and was
+// removed keeps its number, so a file put again never gets the name reported failed.
 func (s *zipSink) nextNumber(cat string) int {
-	n := 0
+	n := s.used[cat]
 	if es, err := os.ReadDir(s.root); err == nil {
 		for _, e := range es {
-			if m := partRe.FindStringSubmatch(e.Name()); m != nil && m[1] == cat {
+			if m := partRe.FindStringSubmatch(strings.TrimSuffix(e.Name(), ".tmp")); m != nil && m[1] == cat {
 				if k, _ := strconv.Atoi(m[2]); k > n {
 					n = k
 				}
@@ -153,6 +218,9 @@ func (s *zipSink) partFor(cat string) (*part, error) {
 		return p, nil
 	}
 	n := s.nextNumber(cat)
+	if s.used != nil {
+		s.used[cat] = n
+	}
 	tmp := filepath.Join(s.root, fmt.Sprintf("%s-%04d.zip.tmp", cat, n))
 	f, err := s.out.Create(tmp)
 	if err != nil {
@@ -302,12 +370,23 @@ func (s *zipSink) closePart(ctx context.Context, cat string) error {
 	}
 	final := strings.TrimSuffix(p.tmp, ".tmp")
 	if err := destfs.RenameRetry(ctx, s.out, p.tmp, final); err != nil {
-		return err
+		// Not in place: its files are reported failed and copied again (never reported as
+		// stored), and the unfinished part goes, so later parts aren't blocked by it.
+		s.out.Remove(p.tmp)
+		for _, e := range p.entries {
+			s.failed = append(s.failed, e.stored)
+		}
+		return fmt.Errorf("zip part %s: %w", filepath.Base(p.tmp), err)
 	}
 	s.out.SyncDir(s.root)
-	for _, e := range p.entries {
+	for i, e := range p.entries {
 		if err := job.Put(s.st, indexBucket, e.stored, e.size); err != nil {
-			return err
+			// Unindexed files don't count as stored on the next run, so they are copied again:
+			// report them failed now rather than OK.
+			for _, e := range p.entries[i:] {
+				s.failed = append(s.failed, e.stored)
+			}
+			return fmt.Errorf("zip part %s: %w", filepath.Base(final), err)
 		}
 	}
 	return nil

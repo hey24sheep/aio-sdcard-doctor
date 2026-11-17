@@ -8,6 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -36,8 +38,15 @@ type Mapfile struct {
 	Blocks    []Block
 }
 
-// maxMapLines bounds parsing (a corrupt or hostile map can't exhaust memory).
+// maxMapLines bounds parsing (a corrupt or hostile map can't exhaust memory) when the card's size
+// isn't known; mapLines gives the bound for a card of a known size.
 const maxMapLines = 1 << 20
+
+// mapLines is the most lines a map of a device of size bytes can need: a block per 512-byte
+// sector, and the comment and status lines.
+func mapLines(size int64) int {
+	return int(max(maxMapLines, min(size/512+64, 1<<40)))
+}
 
 // NewMapfile is an untried map of a device of size bytes.
 func NewMapfile(size int64) *Mapfile {
@@ -64,39 +73,46 @@ func (m *Mapfile) Bytes(st byte) int64 {
 	return n
 }
 
-// Set marks [pos, pos+size) with st, splitting and merging blocks.
+// statusAt is the status of the byte at pos (0 outside the map).
+func (m *Mapfile) statusAt(pos int64) byte {
+	i := sort.Search(len(m.Blocks), func(i int) bool { return m.Blocks[i].Pos+m.Blocks[i].Size > pos })
+	if i < len(m.Blocks) && m.Blocks[i].Pos <= pos {
+		return m.Blocks[i].Status
+	}
+	return 0
+}
+
+// Set marks [pos, pos+size) with st, splitting and merging blocks. Only the blocks it touches
+// are found (binary search) and replaced in place: a damaged card's map holds many blocks.
 func (m *Mapfile) Set(pos, size int64, st byte) {
 	if size <= 0 {
 		return
 	}
-	end := pos + size
-	out := make([]Block, 0, len(m.Blocks)+2)
-	inserted := false
-	for _, b := range m.Blocks {
-		be := b.Pos + b.Size
-		if be <= pos || b.Pos >= end {
-			if b.Pos >= end && !inserted {
-				out = append(out, Block{pos, size, st})
-				inserted = true
-			}
-			out = append(out, b)
-			continue
-		}
-		if b.Pos < pos {
-			out = append(out, Block{b.Pos, pos - b.Pos, b.Status})
-		}
-		if !inserted {
-			out = append(out, Block{pos, size, st})
-			inserted = true
-		}
-		if be > end {
-			out = append(out, Block{end, be - end, b.Status})
+	end, bs := pos+size, m.Blocks
+	i := sort.Search(len(bs), func(k int) bool { return bs[k].Pos+bs[k].Size > pos }) // first touched
+	j := sort.Search(len(bs), func(k int) bool { return bs[k].Pos >= end })           // first after
+	j = max(i, j)
+	var mid [5]Block // what replaces bs[lo:hi]: neighbours it merges with, the parts left, the new one
+	r := mid[:0]
+	lo, hi := i, j
+	if lo > 0 {
+		lo--
+		r = append(r, bs[lo])
+	}
+	if i < j && bs[i].Pos < pos {
+		r = append(r, Block{bs[i].Pos, pos - bs[i].Pos, bs[i].Status})
+	}
+	r = append(r, Block{pos, size, st})
+	if i < j {
+		if last := bs[j-1]; last.Pos+last.Size > end {
+			r = append(r, Block{end, last.Pos + last.Size - end, last.Status})
 		}
 	}
-	if !inserted {
-		out = append(out, Block{pos, size, st})
+	if hi < len(bs) {
+		r = append(r, bs[hi])
+		hi++
 	}
-	m.Blocks = merge(out)
+	m.Blocks = slices.Replace(bs, lo, hi, merge(r)...)
 }
 
 func merge(bs []Block) []Block {
@@ -128,12 +144,14 @@ func (m *Mapfile) next(st byte, from int64) (Block, bool) {
 func validStatus(c byte) bool { return strings.IndexByte("?*/-+", c) >= 0 }
 
 // ParseMapfile reads a GNU ddrescue mapfile.
-func ParseMapfile(r io.Reader) (*Mapfile, error) {
+func ParseMapfile(r io.Reader) (*Mapfile, error) { return parseMapfile(r, maxMapLines) }
+
+func parseMapfile(r io.Reader, maxLines int) (*Mapfile, error) {
 	sc := bufio.NewScanner(r)
 	m := &Mapfile{}
 	haveStatus := false
 	for lines := 0; sc.Scan(); lines++ {
-		if lines > maxMapLines {
+		if lines > maxLines {
 			return nil, errors.New("mapfile: too many lines")
 		}
 		line := strings.TrimSpace(sc.Text())

@@ -22,13 +22,17 @@ func cleanStr(s string) string {
 	}, s)
 }
 
-// isControl: control characters, and the invisible marks that reorder text (bidi overrides and
-// isolates, LRM/RLM, zero-width space) — a crafted name could show "photo.exe" as "photo.jpg".
-// The joiners emoji sequences need (U+200C, U+200D) stay.
+// CleanText is cleanStr for the plain command line, which prints the same card text.
+func CleanText(s string) string { return cleanStr(s) }
+
+// isControl: control characters, line and paragraph separators, and the invisible marks that
+// reorder or hide text (bidi overrides and isolates, LRM/RLM, zero-width space, the format marks
+// U+2060–206F, tag characters) — a crafted name could show "photo.exe" as "photo.jpg". The
+// joiners emoji sequences need (U+200C, U+200D) stay.
 func isControl(r rune) bool {
 	return r < 0x20 || r == 0x7f || r >= 0x80 && r < 0xa0 ||
-		r == 0x200b || r == 0x200e || r == 0x200f || r >= 0x202a && r <= 0x202e ||
-		r >= 0x2066 && r <= 0x2069 || r == 0x061c || r == 0xfeff
+		r == 0x200b || r == 0x200e || r == 0x200f || r == 0x2028 || r == 0x2029 || r >= 0x202a && r <= 0x202e ||
+		r >= 0x2060 && r <= 0x206f || r == 0x061c || r == 0xfeff || r >= 0xe0000 && r <= 0xe007f
 }
 
 func cleanAll(ss []string) []string {

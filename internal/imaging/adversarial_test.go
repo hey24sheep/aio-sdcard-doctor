@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/salvage/faultreader"
 )
 
@@ -125,5 +126,76 @@ func TestResumeFromBakAfterPowerCut(t *testing.T) {
 	}
 	if got, _ := os.ReadFile(im.Out); !bytes.Equal(got, data) {
 		t.Fatal("image differs from the card")
+	}
+}
+
+// Adversarial pass 2 SR3: imaging read 4 KiB at the finest, so one bad 512-byte sector
+// zero-filled the seven readable sectors next to it; bad areas cost only their own sectors now.
+func TestOneBadSectorCostsOnlyItself(t *testing.T) {
+	data := devData(4 * MiB)
+	bad := []faultreader.Range{{Off: MiB + 4096 + 1024, Len: 512}, {Off: 3*MiB + 1536, Len: 8192 + 1024}}
+	dev := &fakeDev{r: faultreader.New(data, bad, faultreader.Options{}), size: int64(len(data))}
+	im := newImage(t, dev)
+	im.RetryPasses = 1
+	if _, err := run(t, im, context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	m := readMap(t, im.Out+".map")
+	if got := m.Bytes(BadSector); got != 512+8192+1024 {
+		t.Fatalf("bad bytes %d, map %+v", got, m.Blocks)
+	}
+	got, _ := os.ReadFile(im.Out)
+	for i := range got {
+		inBad := false
+		for _, r := range bad {
+			inBad = inBad || int64(i) >= r.Off && int64(i) < r.Off+r.Len
+		}
+		if inBad && got[i] != 0 || !inBad && got[i] != data[i] {
+			t.Fatalf("byte %d wrong", i)
+		}
+	}
+}
+
+func blockedBy(p job.Plan, kind string) *job.Issue {
+	for i, is := range p.Issues {
+		if is.Kind == kind && is.Severity == job.Block {
+			return &p.Issues[i]
+		}
+	}
+	return nil
+}
+
+// Adversarial pass 2 M1: card.img.map left without card.img (deleted, or a finished compressed
+// image) passed Plan, and Run then failed with a bare OS error.
+func TestImageLeftoverMapIsExplained(t *testing.T) {
+	data := devData(MiB)
+	im := newImage(t, &fakeDev{r: faultreader.New(data, nil, faultreader.Options{}), size: int64(len(data))})
+	os.WriteFile(im.Out+".map", []byte("0x0 + 1\n0x0 0x100000 +\n"), 0o644)
+	os.WriteFile(im.Out+".xz", []byte("finished"), 0o644)
+	defer im.Close()
+	p, err := im.Plan(context.Background(), job.Env{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	is := blockedBy(p, "image-map-left")
+	if is == nil || !strings.Contains(is.Detail, ".map") || !strings.Contains(is.Detail, "can't be resumed") {
+		t.Fatalf("issues %+v", p.Issues)
+	}
+}
+
+// M2: a map that can't be read (too large, damaged) was ignored by Plan; Run then started over
+// and failed on the existing image file.
+func TestImageUnreadableMapIsExplained(t *testing.T) {
+	data := devData(MiB)
+	im := newImage(t, &fakeDev{r: faultreader.New(data, nil, faultreader.Options{}), size: int64(len(data))})
+	os.WriteFile(im.Out, make([]byte, len(data)), 0o644)
+	os.WriteFile(im.Out+".map", []byte("not a map\n"), 0o644)
+	defer im.Close()
+	p, err := im.Plan(context.Background(), job.Env{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if is := blockedBy(p, "image-map-unreadable"); is == nil {
+		t.Fatalf("issues %+v", p.Issues)
 	}
 }

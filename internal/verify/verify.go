@@ -49,8 +49,10 @@ type Verify struct {
 	Now         func() time.Time
 	WaitTimeout time.Duration
 
-	items   []item
-	reports string
+	items     []item
+	notCopied int // report entries with nothing to check (failed, skipped, excluded …)
+	failed    int // of those, the ones that failed to copy (not left out by choice)
+	reports   string
 }
 
 type item struct {
@@ -82,21 +84,32 @@ func (v *Verify) defaults() {
 
 var recoveredPrefix = regexp.MustCompile(`^Recovered[\\/]`)
 
+// failedCopy: a report status of a file that was meant to be copied and couldn't be (one left out
+// by choice, a duplicate or one copied earlier doesn't make a copy less than whole).
+func failedCopy(s string) bool {
+	switch manifest.Status(s) {
+	case manifest.FAILED, manifest.STALLED, manifest.LOCKED, manifest.UNREADABLE:
+		return true
+	}
+	return false
+}
+
 // load reads manifest.json or a legacy PS copy CSV (later rows win, like Verify-NewCard.ps1).
-func load(p string) ([]item, error) {
+// notCopied counts the entries that name no copied file (failed, skipped, excluded …), failed
+// those of them that failed to copy.
+func load(p string) (out []item, notCopied, failed int, err error) {
 	b, err := os.ReadFile(p)
 	if err != nil {
-		return nil, err
+		return nil, 0, 0, err
 	}
 	b = bytes.TrimPrefix(b, []byte("\xef\xbb\xbf"))
-	var out []item
 	if strings.EqualFold(filepath.Ext(p), ".csv") {
 		rows, err := csv.NewReader(bytes.NewReader(b)).ReadAll()
 		if err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
 		if len(rows) == 0 {
-			return nil, errors.New("empty report")
+			return nil, 0, 0, errors.New("empty report")
 		}
 		col := map[string]int{}
 		for i, h := range rows[0] {
@@ -104,12 +117,23 @@ func load(p string) ([]item, error) {
 		}
 		for _, need := range []string{"Status", "Dest", "Bytes", "SHA256"} {
 			if _, ok := col[need]; !ok {
-				return nil, fmt.Errorf("%s: no %s column", filepath.Base(p), need)
+				return nil, 0, 0, fmt.Errorf("%s: no %s column", filepath.Base(p), need)
 			}
 		}
 		byDest := map[string]item{}
+		last := map[string]bool{}    // each file's last row: copied or not
+		lastBad := map[string]bool{} // and if not, whether it failed
 		for _, r := range rows[1:] {
-			if len(r) < len(rows[0]) || (r[col["Status"]] != "OK" && r[col["Status"]] != "PARTIAL") {
+			if len(r) < len(rows[0]) {
+				continue
+			}
+			k := r[col["Dest"]]
+			if i, ok := col["Source"]; ok {
+				k = r[i]
+			}
+			copied := r[col["Status"]] == "OK" || r[col["Status"]] == "PARTIAL"
+			last[k], lastBad[k] = copied, failedCopy(r[col["Status"]])
+			if !copied {
 				continue
 			}
 			d := strings.ReplaceAll(recoveredPrefix.ReplaceAllString(report.FromCell(r[col["Dest"]]), ""), `\`, "/")
@@ -123,20 +147,41 @@ func load(p string) ([]item, error) {
 		for _, it := range byDest {
 			out = append(out, it)
 		}
+		for k, copied := range last {
+			if !copied {
+				notCopied++
+				if lastBad[k] {
+					failed++
+				}
+			}
+		}
 	} else {
 		var doc struct{ Entries []manifest.Entry }
 		if err := json.Unmarshal(b, &doc); err != nil {
-			return nil, err
+			return nil, 0, 0, err
 		}
 		for _, e := range doc.Entries {
 			switch e.Status {
 			case manifest.OK, manifest.PARTIAL, manifest.DELETED_RECOVERED, manifest.CARVED:
 				out = append(out, item{Source: e.Source, Dest: e.Dest, Bytes: e.Bytes, SHA: e.SHA256})
+			default:
+				notCopied++
+				if failedCopy(string(e.Status)) {
+					failed++
+				}
 			}
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Dest < out[j].Dest })
-	return out, nil
+	return out, notCopied, failed, nil
+}
+
+// notCopiedNote says how many report entries weren't checked, and why.
+func notCopiedNote(n int) string {
+	if n == 1 {
+		return "1 entry in the report was not copied (failed, skipped or left out), so it was not checked"
+	}
+	return fmt.Sprintf("%s entries in the report were not copied (failed, skipped or left out), so they were not checked", preflight.Commas(n))
 }
 
 // Plan loads the manifest and checks the target.
@@ -146,11 +191,11 @@ func (v *Verify) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	if v.Image != "" {
 		return v.planImage()
 	}
-	items, err := load(v.Manifest)
+	items, notCopied, failed, err := load(v.Manifest)
 	if err != nil {
 		return p, fmt.Errorf("reading %s: %w", v.Manifest, err)
 	}
-	v.items, v.reports = items, filepath.Dir(v.Manifest)
+	v.items, v.notCopied, v.failed, v.reports = items, notCopied, failed, filepath.Dir(v.Manifest)
 	if v.Reports != "" {
 		v.reports = v.Reports
 	}
@@ -159,6 +204,12 @@ func (v *Verify) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 			return p, errors.New("a legacy report needs --target (where the files are now)")
 		}
 		v.Target = filepath.Dir(filepath.Dir(v.Manifest))
+	}
+	if len(items) == 0 {
+		p.Issues = append(p.Issues, job.Issue{Kind: "nothing-to-check", Severity: job.Block,
+			Title:   "There is nothing to check: the report lists no copied files",
+			Detail:  notCopiedNote(notCopied),
+			Choices: []job.Choice{job.Stop}, Default: job.Stop})
 	}
 	if _, err := os.Stat(v.Target); err != nil {
 		p.Issues = append(p.Issues, job.Issue{Kind: "no-target", Severity: job.Block, Title: "Can't open the target: " + err.Error(),
@@ -182,12 +233,16 @@ func (v *Verify) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 		p.Bytes += it.Bytes
 	}
 	p.Items = len(items)
+	otherTarget := false
 	if !v.Restart {
 		if s, err := job.OpenStore(v.storePath()); err == nil {
 			done := 0
 			job.ForEach(s, v.bucket(), func(string, row) error { done++; return nil })
+			otherTarget = !v.sameTarget(s)
 			s.Close()
-			if done > 0 && done < len(items) {
+			if otherTarget {
+				v.Restart = true
+			} else if done > 0 && done < len(items) {
 				p.Resume = &job.ResumeInfo{Done: done, Total: len(items)}
 			} else if done >= len(items) {
 				v.Restart = true // the last run finished: check everything again (I9)
@@ -197,6 +252,12 @@ func (v *Verify) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	p.Summary = []string{
 		fmt.Sprintf("Check: %s files (%s) listed in %s", preflight.Commas(len(items)), preflight.GB(p.Bytes), v.Manifest),
 		fmt.Sprintf("In:    %s — only read, nothing there is changed", v.Target),
+	}
+	if notCopied > 0 {
+		p.Summary = append(p.Summary, "Not checked: "+notCopiedNote(notCopied))
+	}
+	if otherTarget {
+		p.Summary = append(p.Summary, "The unfinished check was of a different card or disk at this place: everything is checked again")
 	}
 	p.Result = []string{
 		"For every file: present, same size, same SHA-256 as when it was rescued",
@@ -217,6 +278,27 @@ func (v *Verify) storePath() string { return filepath.Join(v.reports, "verify.db
 func (v *Verify) bucket() string {
 	abs, _ := filepath.Abs(v.Target)
 	return "verify|" + abs
+}
+
+// bucketTarget holds, per target path, the volume the stored results were read from: a card
+// swapped for another at the same drive letter must not inherit the first one's results.
+const bucketTarget = "verify_target"
+
+// targetID is the file-system serial of the volume holding the target ("" if unknown).
+func (v *Verify) targetID() string {
+	d, err := v.LookupDrive(v.Target)
+	if err != nil {
+		return ""
+	}
+	return drives.NormalizeSerial(d.ID.FSSerial)
+}
+
+// sameTarget says whether the stored results were read from the volume now at the target
+// (unknown on either side counts as the same).
+func (v *Verify) sameTarget(s *job.Store) bool {
+	was, _, _ := job.Get[string](s, bucketTarget, v.bucket())
+	now := v.targetID()
+	return was == "" || now == "" || was == now
 }
 
 // Run checks every file (skipping those checked by an interrupted earlier run).
@@ -245,8 +327,13 @@ func (v *Verify) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		return job.Result{}, err
 	}
 	defer st.Close()
-	if v.Restart {
+	if v.Restart || !v.sameTarget(st) {
 		job.ClearBucket(st, v.bucket())
+	}
+	if id := v.targetID(); id != "" {
+		if err := job.Put(st, bucketTarget, v.bucket(), id); err != nil {
+			return job.Result{}, err
+		}
 	}
 	zips := map[string]*zip.ReadCloser{}
 	defer func() {
@@ -269,6 +356,9 @@ func (v *Verify) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 				if err := v.waitTarget(ctx, env); err != nil {
 					return job.Result{Counters: counts}, err
 				}
+				if !v.sameTarget(st) {
+					return job.Result{Counters: counts}, errors.New("stopped: a different card or disk came back at the target — run verify again to check it from the start")
+				}
 				r = v.check(it, zips)
 			}
 			if err := job.Put(st, v.bucket(), it.Dest, r); err != nil {
@@ -283,7 +373,9 @@ func (v *Verify) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		}
 	}
 	csvPath, err := v.writeReports(out, rows, counts, p.Bytes)
-	return job.Result{Counters: counts, Clean: counts["OK"] == len(v.items), Reports: []string{csvPath}}, err
+	// every file matches, and the report has no file that failed to copy or was saved in part
+	clean := len(v.items) > 0 && counts["OK"] == len(v.items) && v.failed == 0 && partials(rows) == 0
+	return job.Result{Counters: counts, Clean: clean, Reports: []string{csvPath}}, err
 }
 
 func (v *Verify) targetPresent() bool {
@@ -305,6 +397,18 @@ func (v *Verify) waitTarget(ctx context.Context, env job.Env) error {
 		timeout = 10 * time.Minute
 	}
 	return retry.WaitUntil(ctx, time.Second, timeout, v.targetPresent)
+}
+
+// partials counts the files saved with unreadable parts zero-filled (…__PARTIAL): they match
+// what was saved, but aren't whole.
+func partials(rows []row) int {
+	n := 0
+	for _, r := range rows {
+		if strings.Contains(r.Path, "__PARTIAL") {
+			n++
+		}
+	}
+	return n
 }
 
 var partRe = regexp.MustCompile(`^(.+)-\d{4,}\.zip$`)
@@ -436,17 +540,19 @@ func (v *Verify) writeReports(out destfs.FS, rows []row, counts map[string]int, 
 	for _, k := range keys {
 		fmt.Fprintf(&s, "  %-12s %8d\n", k, counts[k])
 	}
-	partial := 0 // saved with unreadable parts zero-filled (…__PARTIAL): they match, but aren't whole
-	for _, r := range rows {
-		if strings.Contains(r.Path, "__PARTIAL") {
-			partial++
-		}
-	}
-	if counts["OK"] == len(rows) && partial > 0 {
+	partial := partials(rows)
+	switch {
+	case len(rows) == 0:
+		s.WriteString("\nNothing was checked: the report lists no copied files.\n")
+	case counts["OK"] == len(rows) && partial > 0:
 		fmt.Fprintf(&s, "\nALL FILES MATCH what was saved - but %d of them were saved with unreadable parts filled with zeros (named …__PARTIAL), so the copy is not whole.\n", partial)
-	} else if counts["OK"] == len(rows) {
+	case counts["OK"] == len(rows) && v.failed > 0:
+		fmt.Fprintf(&s, "\nALL FILES MATCH what was saved - but %s; %d of them failed to copy, so the copy is not whole.\n", notCopiedNote(v.notCopied), v.failed)
+	case counts["OK"] == len(rows) && v.notCopied > 0:
+		fmt.Fprintf(&s, "\nALL FILES MATCH - but %s.\n", notCopiedNote(v.notCopied))
+	case counts["OK"] == len(rows):
 		s.WriteString("\nALL FILES MATCH - the copy is a perfect copy.\n")
-	} else {
+	default:
 		s.WriteString("\nProblems (first 100):\n")
 		n := 0
 		for _, r := range rows {
@@ -493,6 +599,9 @@ func (v *Verify) planImage() (job.Plan, error) {
 	}
 	p.Bytes, p.Items = m.Size, 1
 	p.Summary = []string{fmt.Sprintf("Check: %s (%s) against its recorded SHA-256 — only read", v.Image, preflight.GB(m.Size))}
+	if m.BadBytes > 0 {
+		p.Summary = append(p.Summary, fmt.Sprintf("Note: %d bytes were unreadable when imaged (zeros in the image), so even a match is not the whole card", m.BadBytes))
+	}
 	p.Result = []string{"OK when the image is exactly as it was made; CORRUPT if anything changed"}
 	return p, nil
 }
@@ -523,8 +632,8 @@ func (v *Verify) runImage(ctx context.Context) (job.Result, error) {
 	if err != nil {
 		return job.Result{Counters: map[string]int{"UNREADABLE": 1}}, err
 	}
-	if strings.EqualFold(sum, m.SHA256) {
-		return job.Result{Counters: map[string]int{"OK": 1}, Clean: true}, nil
+	if strings.EqualFold(sum, m.SHA256) { // the image is as it was made; whole only if every byte was read
+		return job.Result{Counters: map[string]int{"OK": 1}, Clean: m.BadBytes == 0}, nil
 	}
 	return job.Result{Counters: map[string]int{"CORRUPT": 1}}, nil
 }

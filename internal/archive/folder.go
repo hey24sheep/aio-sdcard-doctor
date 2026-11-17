@@ -42,24 +42,29 @@ func (s *folderSink) Has(dest string, size int64) bool {
 	return err == nil && st.Mode().IsRegular() && st.Size() == size
 }
 
-// Close removes what a stopped or crashed run left in TmpDir — only our own temp files (named by
-// a hash) — and the folder itself once it is empty.
+// Close removes what a stopped or crashed run left in TmpDir.
 func (s *folderSink) Close() error {
-	dir := filepath.Join(s.root, TmpDir)
-	es, err := s.out.ReadDir(dir)
+	cleanFolderTemps(s.out, s.root)
+	return nil
+}
+
+// cleanFolderTemps removes our own temp files (named by a hash) from root's TmpDir, and the
+// folder itself once it is empty.
+func cleanFolderTemps(out destfs.FS, root string) {
+	dir := filepath.Join(root, TmpDir)
+	es, err := out.ReadDir(dir)
 	if err != nil {
-		return nil // nothing there
+		return // nothing there
 	}
 	for _, e := range es {
 		n := e.Name()
 		if h, ok := strings.CutSuffix(n, ".tmp"); ok && len(h) == 40 && !e.IsDir() && isHex(h) {
-			s.out.Remove(filepath.Join(dir, n))
+			out.Remove(filepath.Join(dir, n))
 		}
 	}
-	if es, err := s.out.ReadDir(dir); err == nil && len(es) == 0 {
-		s.out.Remove(dir)
+	if es, err := out.ReadDir(dir); err == nil && len(es) == 0 {
+		out.Remove(dir)
 	}
-	return nil
 }
 
 func isHex(s string) bool {

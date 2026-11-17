@@ -1,6 +1,7 @@
 package fix
 
 import (
+	"context"
 	"strings"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
@@ -10,12 +11,16 @@ import (
 // GateInput is what Gate needs besides the target.
 type GateInput struct {
 	Op         string
-	Verified   bool   // a verified rescue (manifest + ALL FILES MATCH) of this card exists
-	AllowFixed bool   // --allow-fixed
-	Admin      bool   // running as administrator/root
-	BinaryDisk string // PhysicalID of the disk this program runs from
-	HasRescue  func(root string) bool
+	Ctx        context.Context // Stop ends the look for a rescue (nil: none)
+	Verified   bool            // a verified rescue (manifest + ALL FILES MATCH) of this card exists
+	AllowFixed bool            // --allow-fixed
+	Admin      bool            // running as administrator/root
+	BinaryDisk string          // PhysicalID of the disk this program runs from
+	HasRescue  func(root string) (found, complete bool)
 }
+
+// uncheckedWarning starts the warning for a disk too big to look through for a rescue.
+const uncheckedWarning = "There are too many folders on "
 
 // fixedBuses are internal-disk buses: never a card in a reader.
 var fixedBuses = map[string]bool{"nvme": true, "sata": true, "sas": true, "raid": true, "ata": true}
@@ -26,7 +31,11 @@ func Gate(t Target, in GateInput) (warnings []string, err error) {
 	vols := append([]drives.Drive{t.Vol}, t.Disk.Volumes...) // the named volume always counts
 	has := in.HasRescue
 	if has == nil {
-		has = HasRescue
+		ctx := in.Ctx
+		if ctx == nil {
+			ctx = context.Background()
+		}
+		has = func(root string) (bool, bool) { return hasRescue(ctx, root) }
 	}
 	for _, v := range vols {
 		if v.System {
@@ -39,9 +48,21 @@ func Gate(t Target, in GateInput) (warnings []string, err error) {
 	if in.BinaryDisk != "" && in.BinaryDisk == t.Disk.PhysicalID {
 		return nil, &Refused{"this disk holds this program — run it from another disk"}
 	}
+	var unchecked []string // volumes too big to look through completely
+	walked := map[string]bool{}
 	for _, v := range vols {
-		if has(v.Root) {
+		// a check only reads, so a rescue on the disk can't be hurt (SA-8); the named volume is in
+		// the disk's list too, and one walk of a dying card is enough (OA7)
+		if in.Op == OpCheck || walked[v.Root] {
+			continue
+		}
+		walked[v.Root] = true
+		found, complete := has(v.Root)
+		if found {
 			return nil, &Refused{"this disk holds a rescue (" + v.Root + ") — fixing it could destroy your copy"}
+		}
+		if !complete {
+			unchecked = append(unchecked, v.Root)
 		}
 	}
 	if !in.AllowFixed {
@@ -65,6 +86,10 @@ func Gate(t Target, in GateInput) (warnings []string, err error) {
 	}
 	if !in.Admin {
 		return nil, ErrNeedsAdmin
+	}
+	if writes && len(unchecked) > 0 {
+		warnings = append(warnings, uncheckedWarning+strings.Join(unchecked, ", ")+" to check them all for a rescue or a card image. "+
+			"If one you need is on this card, "+strings.ToLower(opWord(in.Op))+" will erase it: make sure it isn't.")
 	}
 	if writes && !in.Verified {
 		warnings = append(warnings, "There is no verified rescue of this card. Rescue (or Image) and Verify it first: "+

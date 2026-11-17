@@ -15,8 +15,8 @@ import (
 
 func card(size uint64) Target {
 	return Target{
-		Vol:  drives.Drive{Root: `Q:\`, Label: "CAMERA", FS: "exFAT", Total: size, Removable: true, PhysicalID: "MOCK7", Device: "/dev/mock1"},
-		Disk: drives.Device{Path: `\\.\MOCK7`, Model: "SD Reader", Bus: "usb", Size: int64(size), Removable: true, PhysicalID: "MOCK7"},
+		Vol:  drives.Drive{Root: `Q:\`, Label: "CAMERA", FS: "exFAT", Total: size, Removable: true, PhysicalID: "MOCK7-fix", Device: "/dev/mock1"},
+		Disk: drives.Device{Path: `\\.\MOCK7`, Model: "SD Reader", Bus: "usb", Size: int64(size), Removable: true, PhysicalID: "MOCK7-fix"},
 	}
 }
 
@@ -30,7 +30,7 @@ func gate(t Target, in GateInput) ([]string, error) {
 		in.Op = OpFormat
 	}
 	if in.HasRescue == nil {
-		in.HasRescue = func(string) bool { return false }
+		in.HasRescue = func(string) (bool, bool) { return false, true }
 	}
 	return Gate(t, in)
 }
@@ -41,7 +41,7 @@ func refused(err error, want string) bool {
 }
 
 func TestGateSystemDriveRefused(t *testing.T) {
-	sys := drives.Drive{Root: `C:\`, System: true, PhysicalID: "MOCK7"}
+	sys := drives.Drive{Root: `C:\`, System: true, PhysicalID: "MOCK7-fix"}
 	_, err := gate(withVols(card(64<<30), sys), GateInput{Verified: true, AllowFixed: true, Admin: true})
 	if !refused(err, "system") {
 		t.Fatalf("err %v", err)
@@ -49,16 +49,16 @@ func TestGateSystemDriveRefused(t *testing.T) {
 }
 
 func TestGateRefusesDiskWithDestination(t *testing.T) {
-	other := drives.Drive{Root: `R:\`, PhysicalID: "MOCK7"}
+	other := drives.Drive{Root: `R:\`, PhysicalID: "MOCK7-fix"}
 	_, err := gate(withVols(card(64<<30), other), GateInput{Verified: true, Admin: true,
-		HasRescue: func(root string) bool { return root == `R:\` }})
+		HasRescue: func(root string) (bool, bool) { return root == `R:\`, true }})
 	if !refused(err, "rescue") {
 		t.Fatalf("err %v", err)
 	}
 }
 
 func TestGateRefusesBinaryDisk(t *testing.T) {
-	_, err := gate(card(64<<30), GateInput{Verified: true, Admin: true, BinaryDisk: "MOCK7"})
+	_, err := gate(card(64<<30), GateInput{Verified: true, Admin: true, BinaryDisk: "MOCK7-fix"})
 	if !refused(err, "this program") {
 		t.Fatalf("err %v", err)
 	}
@@ -236,7 +236,11 @@ func TestAvailablePerOSAndFS(t *testing.T) {
 		{"linux", "exfat", want{false, false, true, true}, "exfatprogs"},
 	}
 	for _, c := range cases {
-		cs := Available(c.goos, card(16<<30), c.fs)
+		tg := card(16 << 30)
+		if c.goos == "linux" {
+			tg.Vol.Root = "" // Linux repairs and formats unmounted cards (a mounted one says how to unmount)
+		}
+		cs := Available(c.goos, tg, c.fs)
 		got := want{cs[0].Enabled, cs[1].Enabled, cs[2].Enabled, cs[3].Enabled}
 		if got != c.w {
 			t.Errorf("%s/%s: %+v", c.goos, c.fs, cs)
@@ -266,12 +270,12 @@ func TestAvailablePerOSAndFS(t *testing.T) {
 
 func TestHasRescueFindsDestinations(t *testing.T) {
 	root := t.TempDir()
-	if HasRescue(root) {
+	if found, _ := HasRescue(root); found {
 		t.Fatal("empty disk has a rescue")
 	}
 	os.MkdirAll(filepath.Join(root, "my rescue", "Reports"), 0o755)
 	os.WriteFile(filepath.Join(root, "my rescue", "Reports", "state.db"), nil, 0o644)
-	if !HasRescue(root) {
+	if found, _ := HasRescue(root); !found {
 		t.Fatal("rescue one folder down not found")
 	}
 }

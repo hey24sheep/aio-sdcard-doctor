@@ -2,8 +2,10 @@ package fix
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 )
 
@@ -155,6 +157,13 @@ func FormatElsewhere(goos string) string {
 	return "format it with GParted, or create a partition and run mkfs.exfat"
 }
 
+// unmountFirst is the reason a Linux card tool waits for the card to be unmounted, with the
+// commands to type.
+func unmountFirst(devs []string, drive, flag string) string {
+	return fmt.Sprintf("unmount the card first: in a terminal run sudo umount %s, then sudo aio-sdcard-doctor fix --drive %s %s",
+		strings.Join(devs, " "), drive, flag)
+}
+
 func Available(goos string, t Target, fsKind string) []job.Capability {
 	fam := family(fsKind)
 	if fsKind == "" {
@@ -205,6 +214,32 @@ func Available(goos string, t Target, fsKind string) []job.Capability {
 		const none = "the card has no partition (as a health test leaves it)"
 		check, why, repair, rwhy = false, none, false, none
 		format, fwhy = false, none+" — "+FormatElsewhere(goos)
+	}
+	// the health test writes the whole disk: without its size it would test the volume only and
+	// call that the whole card
+	if t.Disk.Size <= 0 {
+		health, hwhy = false, "the card's size couldn't be read — unplug it, plug it back in and try again"
+	}
+	// Linux's tools refuse a mounted card, and an unmounted card isn't listed in the window: say
+	// exactly what to type (OA5/SA-3). A missing tool is said first: unmounting won't help that.
+	if goos == "linux" {
+		if dev := nonEmpty(t.Vol.Device, t.Vol.Root); t.Vol.Root != "" {
+			if repair {
+				repair, rwhy = false, unmountFirst([]string{dev}, dev, "--repair")
+			}
+			if format {
+				format, fwhy = false, unmountFirst([]string{dev}, dev, "--format")
+			}
+		}
+		var mounted []string
+		for _, v := range append([]drives.Drive{t.Vol}, t.Disk.Volumes...) {
+			if d := nonEmpty(v.Device, v.Root); v.Root != "" && !slices.Contains(mounted, d) {
+				mounted = append(mounted, d)
+			}
+		}
+		if len(mounted) > 0 && health {
+			health, hwhy = false, unmountFirst(mounted, nonEmpty(t.Disk.Path, "<the card's disk>"), "--health-test")
+		}
 	}
 	if t.Disk.ReadOnly || t.Vol.WriteProtected {
 		const lock = "card is write-protected — slide the lock switch"

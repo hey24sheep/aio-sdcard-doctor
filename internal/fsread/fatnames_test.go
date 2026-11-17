@@ -190,7 +190,7 @@ func TestFATLayoutUsesTheSecondFAT(t *testing.T) {
 	}
 	bps, reserved := int64(le16(b[11:])), int64(le16(b[14:]))
 	fatOff := reserved * bps
-	if _, err := readFATLayout(errAt{bytes.NewReader(b), fatOff + 512, fatOff + 1024}, "fat32"); err != nil {
+	if _, err := readFATLayout(errAt{bytes.NewReader(b), fatOff + 512, fatOff + 1024}, "fat32", int64(len(b))); err != nil {
 		t.Fatalf("a bad sector in FAT #1: %v", err)
 	}
 }

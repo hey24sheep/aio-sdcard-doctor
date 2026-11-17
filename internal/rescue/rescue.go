@@ -12,6 +12,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/elevate"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/fsread"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/ioerr"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/manifest"
@@ -69,6 +71,7 @@ type Rescue struct {
 	From                      string
 	Raw                       bool
 	Volume                    int
+	VolumePicked              bool // the user chose the partition (--volume): no "more partitions" note
 	Dest                      string
 	Types                     []profile.Category // empty or containing "all" = everything, Other included
 	Exclude                   []string           // suggestion ids the user chose to skip ("recommended" = all recommended)
@@ -207,6 +210,28 @@ func (r *Rescue) Close() error {
 	return nil
 }
 
+// wholeCard reports whether the copy reads a whole card (a device, or a volume at its root), the
+// only case where "make a full backup image instead" leads anywhere (OU7): not one folder of the
+// card, not an image file.
+func (r *Rescue) wholeCard() bool {
+	if IsDevicePath(r.From) {
+		return true
+	}
+	if r.srcDrive.Root == "" {
+		return false
+	}
+	a, b := filepath.Clean(r.From), filepath.Clean(r.srcDrive.Root)
+	return a == b || runtime.GOOS == "windows" && strings.EqualFold(a, b)
+}
+
+// stopWith makes Stop (ctx) end every call into the reader process — a read stuck on a dying card,
+// the re-open after a restart — not only the listings (OA12, SA-9).
+func stopWith(src Source, ctx context.Context) {
+	if c, ok := src.(interface{ SetContext(context.Context) }); ok {
+		c.SetContext(ctx)
+	}
+}
+
 // Selection is the user's choice as a Selection.
 func (r *Rescue) Selection() Selection {
 	return Selection{Name: r.Backup, Types: r.Types, Apps: r.Apps, Exclude: r.Exclude, SkipEmpty: r.SkipEmpty}
@@ -217,6 +242,9 @@ func (r *Rescue) Selection() Selection {
 func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	r.defaults()
 	var p job.Plan
+	if err := destfs.CheckRoot(r.Dest); err != nil {
+		return p, err // a pasted path with its quotes, "aux", "a:b": said plainly, before any write
+	}
 	if r.src == nil {
 		src, err := r.OpenSource(r.spec(), r.StallTimeout)
 		if errors.Is(err, source.ErrNeedsAdmin) {
@@ -231,6 +259,7 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 		}
 		r.src = src
 	}
+	stopWith(r.src, ctx)
 	if re, ok := r.src.(interface{ ReadError() string }); ok && re.ReadError() != "" {
 		p.Caps = fsCaps(r.src) // e.g. Read disabled: "not readable by built-in parsers — mount with the OS"
 		p.Issues = append(p.Issues, job.Issue{Kind: "unreadable-fs", Severity: job.Block,
@@ -255,7 +284,7 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	}
 	// one run per card (R14), from the first read: the plan scans the card, so it takes the lock
 	if r.unlock == nil {
-		u, err := job.LockSource(lockKey(r.src.Identity(), r.From, r.srcDrive.Removable))
+		u, err := r.lock(r.src.Identity())
 		if errors.Is(err, job.ErrSourceBusy) {
 			p.Issues = append(p.Issues, job.Issue{Kind: "busy", Severity: job.Block, Title: err.Error(),
 				Detail: "Finish or close the other window first.", Choices: []job.Choice{job.Stop}, Default: job.Stop})
@@ -296,11 +325,11 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 		} else if err == nil {
 			if m, err := manifest.Open(s); err == nil {
 				if s.Recovered() {
-					manifest.Rebuild(m, filepath.Join(r.reportsDir(), "manifest.json"), r.Dest)
+					r.rebuild(env, m)
 					m, _ = manifest.Open(s)
 				}
 				if m.Volume.FSSerial != "" || m.Volume.Model != "" {
-					if ok, _, _ := m.Volume.Matches(r.src.Identity()); !ok {
+					if ok, _, _ := m.Volume.Matches(r.src.Identity()); !ok || !r.sameCard(m) {
 						p.Issues = append(p.Issues, job.Issue{Kind: "dest-other-card", Severity: job.Block,
 							Title:   "This folder holds a rescue of a different card",
 							Detail:  "Choose a new folder.",
@@ -309,14 +338,16 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 				}
 				done := 0
 				m.Each(func(e manifest.Entry) error {
-					if e.Status == manifest.OK {
-						done++
+					if _, _, inZip := archive.ZipPart(e.Dest); e.Status == manifest.OK && (!inZip || archive.ZipIndexHas(s, e.Dest, e.Bytes)) {
+						done++ // an entry of a ZIP part a crash left unfinished isn't done
 					}
 					return nil
 				})
-				in.Already = func(src string) (manifest.Entry, bool) {
-					e, ok, _ := m.Get(src)
-					return e, ok
+				if !(r.Fresh && r.Compress) { // Start over into ZIPs adds every file again
+					in.Already = func(src string) (manifest.Entry, bool) {
+						e, ok, _ := m.Get(src)
+						return e, ok
+					}
 				}
 				if done > 0 && done < len(r.selected) {
 					in.Resume = &job.ResumeInfo{Done: done, Total: len(r.selected)}
@@ -328,6 +359,14 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 		}
 	} else {
 		p.Issues = append(p.Issues, preflight.Check(in)...)
+	}
+	if v, ok := r.src.(interface{ Volumes() []fsread.Volume }); ok && r.Raw && !r.VolumePicked && len(v.Volumes()) > 1 {
+		// One partition per run: say so in every front end, not only the CLI.
+		n := len(v.Volumes())
+		p.Issues = append(p.Issues, job.Issue{Kind: "more-partitions", Severity: job.Info,
+			Title:   fmt.Sprintf("This card has %d partitions; only partition %d is copied", n, r.Volume+1),
+			Detail:  fmt.Sprintf("To copy another, run again with --volume N (0 to %d) into a new folder", n-1),
+			Choices: []job.Choice{job.Continue}, Default: job.Continue})
 	}
 	for _, it := range r.selected {
 		p.Bytes += it.Size
@@ -341,11 +380,11 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	p.Summary = []string{
 		fmt.Sprintf("From: %s — %s; only read, nothing on it is changed", r.From, r.sourceKind()),
 		fmt.Sprintf("To:   %s%s", r.Dest, r.spaceNote(int64(in.Dst.Free), p.Bytes)),
-		fmt.Sprintf("Copy: Backup: %s — %s files (%s) from %s", choice, preflight.Commas(len(r.selected)), preflight.GB(p.Bytes), r.From),
+		fmt.Sprintf("Copy: Backup: %s — %s (%s) from %s", choice, preflight.Files(len(r.selected)), preflight.GB(p.Bytes), r.From),
 		fmt.Sprintf("      %s; card layout: %s", byCategory(r.selected), strings.Join(inv.Profiles, ", ")),
 	}
 	if len(r.excluded) > 0 {
-		p.Summary = append(p.Summary, fmt.Sprintf("Left out by your choice: %d files (%s) — each listed in the report with the reason", len(r.excluded), whyCounts(r.excluded)))
+		p.Summary = append(p.Summary, fmt.Sprintf("Left out by your choice: %s (%s) — each listed in the report with the reason", preflight.Files(len(r.excluded)), whyCounts(r.excluded)))
 	}
 	empty, comp := "empty files copied", "not compressed"
 	if r.SkipEmpty {
@@ -356,7 +395,7 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	}
 	p.Summary = append(p.Summary, "Options: "+empty+" · "+comp)
 	if len(inv.Unlistable) > 0 {
-		p.Summary = append(p.Summary, fmt.Sprintf("Warning: %d folders could not be listed (possible damage)", len(inv.Unlistable)))
+		p.Summary = append(p.Summary, fmt.Sprintf("Warning: %s could not be listed (possible damage)", preflight.Folders(len(inv.Unlistable))))
 	}
 	if r.Compress {
 		p.Result = append(p.Result, fmt.Sprintf("ZIP files in %s, one series per type (%s), opened by Windows, macOS, Linux or 7-Zip",
@@ -370,6 +409,48 @@ func (r *Rescue) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 		fmt.Sprintf("A report of every file (CSV, summary, manifest.json) in %s", r.reportsDir()),
 		"Stop any time; running the same command again continues where it stopped")
 	return p, nil
+}
+
+// errEnough ends a walk over the manifest early.
+var errEnough = errors.New("enough")
+
+// sameCard backs up the serial check on resume (some devices give every card one serial): the
+// size, when the card is read the same way as before, and a sample of up to 20 copied files, of
+// which at least one must still be on the card with its size once 5 or more were looked at.
+func (r *Rescue) sameCard(m *manifest.Manifest) bool {
+	id := r.src.Identity()
+	if m.SourceKind == r.src.Kind() && m.Volume.Size != 0 && id.Size != 0 && m.Volume.Size != id.Size {
+		return false
+	}
+	sampled, found := 0, 0
+	m.Each(func(e manifest.Entry) error {
+		if e.Status != manifest.OK || strings.HasSuffix(e.Source, "/") {
+			return nil
+		}
+		sampled++
+		if fi, err := r.src.Stat(e.Source); err == nil && fi.Size() == e.Bytes {
+			found++
+			return errEnough
+		}
+		if sampled >= 20 {
+			return errEnough
+		}
+		return nil
+	})
+	return sampled < 5 || found > 0
+}
+
+// rebuild refills a damaged progress record from manifest.json and the files on the
+// destination, and tells the user.
+func (r *Rescue) rebuild(env job.Env, m *manifest.Manifest) {
+	n, err := manifest.Rebuild(m, filepath.Join(r.reportsDir(), "manifest.json"), r.Dest)
+	switch {
+	case env.Log == nil:
+	case err != nil:
+		env.Log("warn", "The progress record was damaged and could not be rebuilt ("+err.Error()+") — files are checked and copied again")
+	default:
+		env.Log("info", fmt.Sprintf("Rebuilt progress from your files — nothing was lost (%s)", preflight.Files(n)))
+	}
 }
 
 // undecided keeps only the skip suggestions the user's choice hasn't already decided.
@@ -491,8 +572,15 @@ type run struct {
 	st         *job.Store
 	keptBad    int // rows from an earlier run, outside this choice, that are not fully copied
 	zparts     archive.ZipParts
-	destSerial string // the destination volume's serial when the run started ("" if unknown)
-	destMoved  bool   // the card came back where the destination was: nothing more is written
+	destSerial string                    // the destination volume's serial when the run started ("" if unknown)
+	destMoved  bool                      // the card came back where the destination was: nothing more is written
+	replaced   map[string]manifest.Entry // a new copy's stored name → the earlier row it replaced
+	retryWhy   string                    // why the current file is being tried again (for "gave up")
+	held       *manifest.Entry           // this file's copy stored before the card went away (recorded, not yet counted)
+	refused    *int64                    // this read's unreadable bytes when its copy was refused as worse
+	skippedVid int                       // videos left out because the user chose to skip them
+	handled    map[string]bool           // files finished in this run (for "N files left")
+	kept       map[string]bool           // files outside this choice kept as an earlier run left them
 }
 
 func (x *run) ask(is job.Issue) job.Choice {
@@ -525,6 +613,29 @@ func lockKey(id drives.Identity, from string, removable bool) string {
 	return k
 }
 
+// lock takes the card's lock and, for a card, its physical disk's lock — every job reading that
+// disk takes it, so a card without a serial is locked the same way whatever identity each job
+// worked out for it (OA3). A folder on a fixed disk doesn't lock the whole disk.
+func (r *Rescue) lock(id drives.Identity) (func(), error) {
+	unlock, err := job.LockSource(lockKey(id, r.From, r.srcDrive.Removable))
+	if err != nil {
+		return nil, err
+	}
+	phys := r.srcDrive.PhysicalID
+	if phys == "" {
+		phys = id.PhysicalID
+	}
+	if k := (drives.Identity{PhysicalID: phys}).DiskLockKey(); k != "" && r.srcDrive.Removable {
+		disk, err := job.LockSource(k)
+		if err != nil {
+			unlock()
+			return nil, err
+		}
+		return func() { disk(); unlock() }, nil
+	}
+	return unlock, nil
+}
+
 // Run copies the planned files.
 func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, error) {
 	r.defaults()
@@ -536,6 +647,7 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	if r.src == nil {
 		return job.Result{}, errors.New("rescue: Plan first")
 	}
+	stopWith(r.src, ctx)
 	out := env.Out
 	if out == nil {
 		out = destfs.New(r.Dest, r.sourceRoots()...)
@@ -553,16 +665,14 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		return job.Result{}, err
 	}
 	if st.Recovered() {
-		if n, err := manifest.Rebuild(m, filepath.Join(r.reportsDir(), "manifest.json"), r.Dest); err == nil && env.Log != nil {
-			env.Log("info", fmt.Sprintf("Rebuilt progress from your files — nothing was lost (%d files)", n))
-		}
+		r.rebuild(env, m)
 	}
 	id := r.src.Identity()
 	unlock := r.unlock // taken by Plan; held until this run ends
 	r.unlock = nil
 	if unlock == nil {
 		var err error
-		if unlock, err = job.LockSource(lockKey(id, r.From, r.srcDrive.Removable)); err != nil {
+		if unlock, err = r.lock(id); err != nil {
 			return job.Result{}, err
 		}
 	}
@@ -570,7 +680,7 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	if release, err := job.Inhibit("copying files off a card"); err == nil {
 		defer release()
 	}
-	m.Volume, m.SourceKind, m.Profiles = id, r.src.Kind(), r.inv.Profiles
+	m.Volume, m.SourceKind, m.SourceRoot, m.Profiles = id, r.src.Kind(), r.From, r.inv.Profiles
 	m.Excluded = r.Exclude
 	m.Backup, m.Types, m.Apps, m.SkipEmpty, m.Compress = r.Backup, r.Types, r.Apps, r.SkipEmpty, r.Compress
 	if err := m.SaveMeta(); err != nil {
@@ -581,11 +691,34 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	x := &run{r: r, env: env, ctx: rctx, cancel: cancel, out: out, m: m, st: st, copier: salvage.NewCopier(),
 		from: r.From, id: id, counts: map[string]int{}, plan: paths.NewPlanner(r.Dest, paths.MaxPath),
 		thr: job.Throttle{Every: 100 * time.Millisecond}, destSerial: drives.VolumeSerial(r.Dest)}
+	x.plan.Windows = windowsFS(r.dstDrive.FS) || r.Compress // ZIP parts get opened in Explorer too
+	// a crashed run in the other mode (Compress switched) left its temp files too
+	archive.CleanTemps(out, r.Dest)
 	x.sink = archive.FolderSink(out, r.Dest)
 	if r.Compress {
 		x.sink = archive.ZipSink(out, r.Dest, st)
 	}
 	start := r.Now()
+	// Every copy an earlier run recorded keeps its name, even for files this run doesn't list or
+	// select: otherwise a case-clashing name could be planned onto it and overwrite it.
+	// Claimed under the name the file is planned by (a LOST.DIR fragment's carries its sniffed
+	// extension), or the file's own earlier copy would look like another file's.
+	key := map[string]string{}
+	for _, it := range r.inv.Items {
+		if k := destRel(it); k != it.Rel {
+			key[it.Rel] = k
+		}
+	}
+	m.Each(func(e manifest.Entry) error {
+		if d := plannedDest(e); d != "" {
+			k, ok := key[e.Source]
+			if !ok {
+				k = e.Source
+			}
+			x.plan.Claim(d, k)
+		}
+		return nil
+	})
 	for _, it := range r.selected {
 		x.plan.Add(it.Cat, destRel(it))
 		x.total += it.Size
@@ -604,13 +737,26 @@ func (r *Rescue) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	if fz, ok := x.sink.(interface{ Failed() []string }); ok {
 		x.markFailed(fz.Failed())
 	}
+	x.dropSuperseded()
 	x.recordUnlistable()
-	x.writeReports(start)
+	if n := x.skippedVid; n > 0 { // the user's choice, so the run stays clean — but it shows
+		v := preflight.Commas(n) + " videos"
+		if n == 1 {
+			v = "1 video"
+		}
+		x.sum.Issues = append(x.sum.Issues, v+" left out because you chose to skip the remaining videos (the card was degrading) — run again to copy them")
+	}
 	if x.keptBad > 0 {
 		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%d files from an earlier run are outside this choice and not fully copied — choose them again to retry", x.keptBad))
 	}
-	res := job.Result{Counters: x.counts, Clean: x.counts["PARTIAL"]+x.counts["FAILED"]+x.counts["STALLED"]+x.counts["LOCKED"]+x.keptBad == 0}
-	res.Reports = []string{x.sum.CSV}
+	csvPath, repErr := x.writeReports(start)
+	if repErr != nil {
+		x.log("warn", "Some reports could not be written — your copied files are not affected: "+repErr.Error())
+	}
+	res := job.Result{Counters: x.counts, Clean: repErr == nil && x.counts["PARTIAL"]+x.counts["FAILED"]+x.counts["STALLED"]+x.counts["LOCKED"]+x.keptBad == 0}
+	if csvPath != "" {
+		res.Reports = []string{csvPath}
+	}
 	if runErr != nil && ctx.Err() != nil {
 		return res, ctx.Err()
 	}
@@ -638,16 +784,19 @@ func (x *run) recordUnlistable() {
 		src := strings.TrimSuffix(dir, "/") + "/"
 		now[src] = true
 		put(manifest.Entry{Source: src, Status: manifest.FAILED,
-			Error: "folder could not be listed (possible damage) — the files in it were not copied: " + why})
+			Error: "folder could not be listed completely (possible damage) — files in it that could not be listed were not copied: " + why})
 	}
 	for _, u := range x.r.inv.Unreadable {
 		f, why, _ := strings.Cut(u, ": ")
+		now[f] = true
 		put(manifest.Entry{Source: f, Status: manifest.FAILED, Error: "its details could not be read (possible damage) — not copied: " + why})
 	}
-	// a folder that couldn't be listed before and was listed this time: its old row goes
+	// a folder that couldn't be listed before and was listed this time, or a name a damaged folder
+	// listed twice that it lists once now: its old row goes
 	var stale []string
 	x.m.Each(func(e manifest.Entry) error {
-		if strings.HasSuffix(e.Source, "/") && e.Status == manifest.FAILED && !now[e.Source] {
+		dup := strings.HasSuffix(e.Source, " with this name)")
+		if (strings.HasSuffix(e.Source, "/") || dup) && e.Status == manifest.FAILED && !now[e.Source] {
 			stale = append(stale, e.Source)
 		}
 		return nil
@@ -656,11 +805,28 @@ func (x *run) recordUnlistable() {
 		x.m.Delete(s)
 	}
 	if n := len(x.r.inv.Unreadable); n > 0 {
-		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%d files could not be read at all (possible damage) — try Image, or Find deleted files with Deep scan", n))
+		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%s could not be read at all (possible damage) — try Image, or Find deleted files with Deep scan", preflight.Files(n)))
 	}
 	if n := len(x.r.inv.Unlistable); n > 0 {
-		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%d folders could not be listed; their files were not copied — try Image, or Find deleted files with Deep scan", n))
+		x.sum.Issues = append(x.sum.Issues, fmt.Sprintf("%s could not be listed completely; files in them that could not be listed were not copied — try Image, or Find deleted files with Deep scan", preflight.Folders(n)))
 	}
+}
+
+// plannedDest is the destination the planner gave e's file in the run that stored it — the ZIP
+// part and the __PARTIAL suffix taken off — or "" when nothing is stored.
+func plannedDest(e manifest.Entry) string {
+	d := e.Dest
+	if d == "" {
+		return ""
+	}
+	if part, name, ok := archive.ZipPart(d); ok {
+		d = part[:strings.LastIndex(part, "-")] + "/" + name
+	}
+	if e.Status == manifest.PARTIAL {
+		ext := path.Ext(d)
+		d = strings.TrimSuffix(strings.TrimSuffix(d, ext), "__PARTIAL") + ext
+	}
+	return d
 }
 
 // destRel is the path a file is planned under: fragments get their sniffed extension.
@@ -699,6 +865,10 @@ func (x *run) recordExcluded() {
 		if old, ok, _ := x.m.Get(ex[0]); ok && old.Status != manifest.EXCLUDED {
 			// From an earlier run with a wider choice: kept as it is, counted and reported.
 			x.counts["KEPT-FROM-EARLIER-RUN"]++
+			if x.kept == nil {
+				x.kept = map[string]bool{}
+			}
+			x.kept[ex[0]] = true
 			switch old.Status {
 			case manifest.OK, manifest.ALREADY_COPIED:
 			default:
@@ -721,10 +891,20 @@ func (x *run) loop(items []scan.Item) ([]scan.Item, error) {
 			return again, err
 		}
 		if x.skipVid && it.Cat == profile.Videos {
+			if old, ok, _ := x.m.Get(it.Rel); ok && (old.Status == manifest.OK || old.Status == manifest.PARTIAL) &&
+				old.Dest != "" && x.stored(old.Dest, old.Bytes) {
+				// Copied by an earlier run: kept as it is, counted and reported (as recordExcluded).
+				x.counts["KEPT-FROM-EARLIER-RUN"]++
+				if old.Status != manifest.OK {
+					x.keptBad++
+				}
+				continue
+			}
 			e := manifest.Entry{Source: it.Rel, Category: it.Cat, Bytes: it.Size, Status: manifest.EXCLUDED, Error: "skipped by you (card degrading)"}
 			x.m.Put(e)
 			x.count(manifest.EXCLUDED)
 			x.sum.Add(e)
+			x.skippedVid++
 			continue
 		}
 		st, err := x.one(it)
@@ -813,8 +993,12 @@ func (x *run) one(it scan.Item) (manifest.Status, error) {
 		return manifest.ALREADY_COPIED, nil
 	}
 	e := manifest.Entry{Source: it.Rel, Category: it.Cat, Bytes: it.Size, MTime: it.MTime, SrcMTime: it.MTime}
+	var prev *manifest.Entry
+	if had {
+		prev = &old
+	}
 	if isFAT(r.dstDrive.FS) && it.Size > preflight.FATMaxFile {
-		return x.finish(e, manifest.FAILED, "destination file system can't hold files this large (FAT32 4 GiB limit?)")
+		return x.finish(e, manifest.FAILED, "destination file system can't hold files this large (FAT32 4 GiB limit?)", prev)
 	}
 	for attempt := 0; ; attempt++ {
 		if err := x.ctx.Err(); err != nil {
@@ -826,7 +1010,18 @@ func (x *run) one(it scan.Item) (manifest.Status, error) {
 			}
 			return "", err
 		}
+		x.retryWhy = "the card kept disappearing or not responding"
 		st, msg, retryFile, err := x.copyOne(it, dest, old, had, &e)
+		if h := x.held; h != nil {
+			// The card went away after this read was stored: that copy is now the one to keep and
+			// to compare the next read against.
+			x.held = nil
+			old, had, prev = *h, true, h
+			if err != nil { // the run stops here: report the copy it holds
+				x.count(h.Status)
+				x.sum.Add(*h)
+			}
+		}
 		if err != nil {
 			return "", err
 		}
@@ -834,20 +1029,38 @@ func (x *run) one(it scan.Item) (manifest.Status, error) {
 			if attempt < 3 {
 				continue
 			}
-			st, msg = manifest.FAILED, "gave up after 4 attempts (the card kept disappearing or not responding)"
+			st, msg = manifest.FAILED, "gave up after 4 attempts: "+x.retryWhy
 		}
-		return x.finish(e, st, msg)
+		return x.finish(e, st, msg, prev)
 	}
 }
 
-// sameTime compares modification times with FAT's 2-second resolution, also accepting an
-// exact one-hour shift (Windows converts FAT local times with the current DST offset).
+// sameTime compares modification times with FAT's 2-second resolution, also accepting a shift by
+// a whole number of quarter hours up to 14 hours: Windows converts FAT local times with the
+// current DST offset, and the same card read as a mounted folder and then raw (or as an image)
+// can show every time moved by the local UTC offset (exFAT times without an offset, Linux vfat).
+// The cost: a same-size edit an exact number of quarter hours later is not copied again.
 func sameTime(a, b time.Time) bool {
 	d := a.Sub(b)
 	if d < 0 {
 		d = -d
 	}
-	return d < 2*time.Second || (d > time.Hour-2*time.Second && d < time.Hour+2*time.Second)
+	if d < 2*time.Second {
+		return true
+	}
+	const q = 15 * time.Minute
+	r := d % q
+	return d <= 14*time.Hour+2*time.Second && (r <= 2*time.Second || q-r <= 2*time.Second)
+}
+
+// windowsFS reports a destination file system with Windows' name rules (FAT, exFAT, NTFS — the
+// last as Linux names it, "fuseblk" for ntfs-3g included), even when written from Linux or macOS.
+func windowsFS(fsName string) bool {
+	switch strings.ToUpper(fsName) {
+	case "EXFAT", "NTFS", "NTFS3", "FUSEBLK":
+		return true
+	}
+	return isFAT(fsName)
 }
 
 func isFAT(fsName string) bool {
@@ -860,6 +1073,9 @@ func isFAT(fsName string) bool {
 
 // spaceCheck makes sure the file fits before writing (proactive disk-full).
 func (x *run) spaceCheck(size int64) (job.Choice, error) {
+	if x.r.Compress {
+		size *= 2 // spooled first, then added to its ZIP part
+	}
 	for i := 0; i < 1000; i++ {
 		free, err := x.r.Free(x.r.Dest)
 		if err != nil || int64(free) >= size+preflight.Reserve {
@@ -899,56 +1115,124 @@ func (x *run) copyOne(it scan.Item, dest string, old manifest.Entry, had bool, e
 		return string(ch)
 	}}
 	accept := func(res salvage.Result) bool {
-		if !had || x.r.Fresh || old.Bytes != it.Size || !sameTime(old.SrcMTime, it.MTime) {
-			return true // nothing yet, Start over, or the file changed on the card: the new copy wins
+		if !had || old.Bytes != it.Size || !sameTime(old.SrcMTime, it.MTime) {
+			return true // nothing yet, or the file changed on the card: the new copy wins
+		}
+		if old.Dest == "" || !x.stored(old.Dest, old.Bytes) {
+			return true // nothing stored, or the copy (good or partial) was deleted from the destination
 		}
 		cand := manifest.Entry{Status: manifest.OK, BadBytes: res.Bad}
 		if res.Bad > 0 {
 			cand.Status = manifest.PARTIAL
 		}
-		if old.Status == manifest.OK && !x.stored(old.Dest, old.Bytes) {
-			return true // the good copy was deleted from the destination
+		if x.r.Fresh {
+			return !manifest.Better(cand, old) // Start over: the new copy wins unless it is worse
 		}
 		return manifest.Better(old, cand)
 	}
+	var cardErr error // set when reading the card failed, not writing the copy
 	stored, res, err := x.sink.Put(x.ctx, dest, it.MTime, func(w io.Writer) (salvage.Result, error) {
-		return x.copier.Copy(x.ctx, b, size, w)
+		dw := &destWriter{w: w}
+		res, err := x.copier.Copy(x.ctx, b, size, dw)
+		if err != nil && dw.err == nil {
+			cardErr = err
+		}
+		return res, err
 	}, accept)
 	if err != nil {
+		if cardErr == nil {
+			err = destError{err} // never the card's fault: no "card removed" or "degrading" question
+		}
 		return x.classify(err)
 	}
 	e.SHA256 = strings.ToUpper(fmt.Sprintf("%x", res.Sum))
 	e.BadBytes = res.Bad
 	if res.Bad > 0 {
 		if gone, retry, err := x.cardGone(); gone || err != nil {
+			if stored != "" {
+				// What was read is on the destination: record it now, so it is never lost track
+				// of — nor replaced by a worse read — whether the run goes on or stops here.
+				h := *e
+				h.Dest, h.Status = stored, manifest.PARTIAL
+				h.Error = fmt.Sprintf("%d bytes unreadable (zero-filled) — the card went away while this file was read", res.Bad)
+				x.noteReplaced(stored, old, had)
+				if perr := x.m.Put(h); perr != nil && err == nil {
+					err = perr
+				}
+				x.held = &h
+			}
 			return "", "", retry, err
 		}
 	}
 	if stored == "" { // a worse copy than the one we already have
 		*e = old
+		x.refused = &res.Bad // the health monitor hears about this read, not the kept copy
 		return old.Status, old.Error, false, nil
 	}
 	e.Dest = stored
+	x.noteReplaced(stored, old, had)
 	if res.Bad > 0 {
 		return manifest.PARTIAL, fmt.Sprintf("%d bytes unreadable (zero-filled)", res.Bad), false, nil
 	}
 	return manifest.OK, "", false, nil
 }
 
+// noteReplaced remembers the earlier row a new copy replaced: a ZIP part that later fails falls
+// back to it (markFailed).
+func (x *run) noteReplaced(stored string, old manifest.Entry, had bool) {
+	if had && old.Dest != "" && old.Dest != stored {
+		if x.replaced == nil {
+			x.replaced = map[string]manifest.Entry{}
+		}
+		x.replaced[stored] = old
+	}
+}
+
+// destError is a failure writing the copy to the destination.
+type destError struct{ err error }
+
+func (e destError) Error() string { return e.err.Error() }
+func (e destError) Unwrap() error { return e.err }
+
+// destWriter remembers a failed write, telling a destination error from a card error.
+type destWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (d *destWriter) Write(p []byte) (int, error) {
+	n, err := d.w.Write(p)
+	if err != nil {
+		d.err = err
+	}
+	return n, err
+}
+
 // classify turns a copy error into a status, or a question to the user.
 func (x *run) classify(err error) (manifest.Status, string, bool, error) {
+	var de destError
 	switch {
 	case x.ctx.Err() != nil:
 		return "", "", false, x.ctx.Err()
+	case errors.As(err, &de) && !ioerr.IsDiskFull(err) && !ioerr.IsTooLarge(err) && !ioerr.IsLocked(err):
+		if st, serr := os.Stat(x.r.Dest); errors.Is(err, fs.ErrNotExist) || serr != nil || !st.IsDir() {
+			return "", "", false, fmt.Errorf("stopped: the destination %s can't be reached any more (unplugged, or the network share dropped) — reconnect it, then run the same command again to continue (%w)", x.r.Dest, err)
+		}
+		return manifest.FAILED, "couldn't be written to the destination: " + err.Error(), false, nil
 	case errors.Is(err, source.ErrTooManyRestarts):
 		const notResponding = "the card stopped responding (skipped — run again to retry)"
 		if x.giveUp {
 			return manifest.FAILED, notResponding, false, nil
 		}
-		c := x.ask(job.Issue{Kind: "card-not-responding", Severity: job.Warn,
+		is := job.Issue{Kind: "card-not-responding", Severity: job.Warn,
 			Title:   "The card stopped responding",
-			Detail:  "Wait and keep trying, skip the remaining files (reported FAILED; run again later), make a full backup image instead (safer for a dying card), or stop.",
-			Choices: []job.Choice{job.Wait, SkipRest, job.Image, job.Stop}, Default: notRespondingDefault(x.r.Interactive)})
+			Detail:  "Wait and keep trying, skip the remaining files (reported FAILED; run again later), or stop.",
+			Choices: []job.Choice{job.Wait, SkipRest, job.Stop}, Default: notRespondingDefault(x.r.Interactive)}
+		if x.r.wholeCard() {
+			is.Detail = "Wait and keep trying, skip the remaining files (reported FAILED; run again later), make a full backup image instead (safer for a dying card), or stop."
+			is.Choices = []job.Choice{job.Wait, SkipRest, job.Image, job.Stop}
+		}
+		c := x.ask(is)
 		switch c {
 		case job.Wait:
 			x.r.src.ResetBudget()
@@ -971,6 +1255,7 @@ func (x *run) classify(err error) (manifest.Status, string, bool, error) {
 			Detail:  "Free some space on the destination, then retry. Everything copied so far is safe.",
 			Choices: []job.Choice{job.Retry, job.Stop}, Default: job.Stop})
 		if c == job.Retry {
+			x.retryWhy = "the destination stayed full"
 			return "", "", true, nil
 		}
 		return "", "", false, errors.New("stopped: the destination is full")
@@ -1031,28 +1316,57 @@ func (x *run) cardGone() (gone, retry bool, err error) {
 
 var waitUntil = retry.WaitUntil
 
-func (x *run) finish(e manifest.Entry, st manifest.Status, msg string) (manifest.Status, error) {
+// finish records a file's outcome. old is the row an earlier run left (nil if none).
+func (x *run) finish(e manifest.Entry, st manifest.Status, msg string, old *manifest.Entry) (manifest.Status, error) {
 	e.Status, e.Error = st, msg
-	if err := x.m.Put(e); err != nil {
+	row := e
+	if old != nil && e.Dest == "" && old.Dest != "" && manifest.Better(e, *old) && x.stored(old.Dest, old.Bytes) {
+		if old.Bytes == e.Bytes && sameTime(old.SrcMTime, e.SrcMTime) {
+			// Nothing better was stored this time and an earlier copy of this same file is still
+			// on the destination: keep its row (status, copy, bad bytes) — it is what the
+			// destination holds, and the next run must still compare against it — and note the
+			// failure, worded so it stays true in later runs.
+			row = *old
+			row.Error = "a later attempt failed (" + msg + ") — the earlier copy is kept"
+		} else {
+			// The file changed on the card since that copy: it holds an older version, not this
+			// file. Report this failure; the old copy stays on the destination untouched.
+			row.Error = msg + " — an older version of this file is kept at " + old.Dest
+		}
+	}
+	if err := x.m.Put(row); err != nil {
 		return st, err
 	}
-	x.count(st)
-	x.sum.Add(e)
+	x.count(row.Status)
+	x.sum.Add(row)
+	if x.handled == nil {
+		x.handled = map[string]bool{}
+	}
+	x.handled[e.Source] = true
 	if st != manifest.OK && st != manifest.ALREADY_COPIED {
 		x.log("warn", fmt.Sprintf("[%s] %s %s", st, e.Source, msg))
 	}
-	if x.mon.file(st, e.Bytes, e.BadBytes) {
+	monSt, monBad := st, e.BadBytes
+	if x.refused != nil {
+		monSt, monBad, x.refused = manifest.PARTIAL, *x.refused, nil
+	}
+	if x.mon.file(monSt, e.Bytes, monBad) {
 		left, bytes := 0, int64(0)
-		for _, it := range x.r.selected {
-			if g, ok, _ := x.m.Get(it.Rel); !ok || g.Status == "" {
+		for _, it := range x.r.selected { // not finished in this run, and not copied by an earlier one
+			if g, _, _ := x.m.Get(it.Rel); !x.handled[it.Rel] && g.Status != manifest.OK {
 				left++
 				bytes += it.Size
 			}
 		}
-		c := x.ask(job.Issue{Kind: "card-degrading", Severity: job.Warn,
-			Title:   fmt.Sprintf("The card is degrading — %d files (%s) left", left, preflight.GB(bytes)),
-			Detail:  "Continue, skip the remaining videos (largest, slowest to read), make a full backup image instead, or stop.",
-			Choices: []job.Choice{job.Continue, SkipVideos, job.Image, job.Stop}, Default: job.Continue})
+		is := job.Issue{Kind: "card-degrading", Severity: job.Warn,
+			Title:   fmt.Sprintf("The card is degrading — %s (%s) left", preflight.Files(left), preflight.GB(bytes)),
+			Detail:  "Continue, skip the remaining videos (largest, slowest to read), or stop.",
+			Choices: []job.Choice{job.Continue, SkipVideos, job.Stop}, Default: job.Continue}
+		if x.r.wholeCard() {
+			is.Detail = "Continue, skip the remaining videos (largest, slowest to read), make a full backup image instead, or stop."
+			is.Choices = []job.Choice{job.Continue, SkipVideos, job.Image, job.Stop}
+		}
+		c := x.ask(is)
 		switch c {
 		case SkipVideos:
 			x.skipVid = true
@@ -1065,7 +1379,23 @@ func (x *run) finish(e manifest.Entry, st manifest.Status, msg string) (manifest
 	return st, nil
 }
 
-// markFailed turns entries whose ZIP part failed verification into FAILED rows.
+// dropSuperseded removes a folder __PARTIAL copy an earlier run left once a better copy of the
+// same file is safely in a finished ZIP part: it is our own file, and no row points at it any more.
+func (x *run) dropSuperseded() {
+	for stored, old := range x.replaced {
+		_, _, inZip := archive.ZipPart(stored)
+		_, _, oldInZip := archive.ZipPart(old.Dest)
+		if !inZip || oldInZip || old.Status != manifest.PARTIAL || old.Dest == "" {
+			continue
+		}
+		if cur, ok, _ := x.m.Get(old.Source); ok && cur.Dest == stored && archive.ZipIndexHas(x.st, stored, cur.Bytes) {
+			x.out.Remove(filepath.Join(x.r.Dest, filepath.FromSlash(old.Dest)))
+		}
+	}
+}
+
+// markFailed turns entries whose ZIP part failed verification or couldn't be saved into FAILED
+// rows — or back into the earlier run's row when that copy is still on the destination.
 func (x *run) markFailed(stored []string) {
 	if len(stored) == 0 {
 		return
@@ -1081,29 +1411,54 @@ func (x *run) markFailed(stored []string) {
 		}
 		return nil
 	})
+	const why = "the compressed part holding it could not be finished (failed verification or couldn't be saved) — run again to copy it again"
 	for _, e := range fix {
 		x.counts[string(e.Status)]--
-		e.Status, e.Error, e.Dest = manifest.FAILED, "the compressed part holding it failed verification", ""
-		x.m.Put(e)
-		x.count(manifest.FAILED)
+		x.sum.Remove(e) // the summary must agree with the CSV
+		n := e
+		n.Status, n.Error, n.Dest, n.BadBytes, n.SHA256, n.Header = manifest.FAILED, why, "", 0, "", "" // no copy, no header check
+		if old, ok := x.replaced[e.Dest]; ok && x.stored(old.Dest, old.Bytes) {
+			n = old // the earlier copy is still there: never report less than what is on the destination
+			n.Error = "a later copy failed (" + why + ") — the earlier copy is kept"
+		}
+		x.m.Put(n)
+		x.count(n.Status)
+		x.sum.Add(n)
 	}
 }
 
-func (x *run) writeReports(start time.Time) {
+// writeReports writes manifest.json, the CSV and the summary. It returns the CSV's path ("" if
+// it couldn't be written) and what failed, so the run never points at a report that isn't there.
+func (x *run) writeReports(start time.Time) (string, error) {
 	stamp := report.Stamp(x.r.Now())
 	dir := x.r.reportsDir()
 	csvPath := report.UniquePath(filepath.Join(dir, "copy_"+stamp+".csv"))
-	x.m.ExportJSON(x.out, filepath.Join(dir, "manifest.json"))
-	report.WriteCSV(x.out, csvPath, x.m.Each)
+	var errs []error
+	if err := x.m.ExportJSON(x.out, filepath.Join(dir, "manifest.json")); err != nil {
+		errs = append(errs, fmt.Errorf("manifest.json: %w", err))
+	}
+	x.sum.CSV = csvPath
+	if err := report.WriteCSV(x.out, csvPath, x.m.Each); err != nil {
+		errs = append(errs, fmt.Errorf("%s: %w", filepath.Base(csvPath), err))
+		x.sum.Issues = append(x.sum.Issues, "The list of every file (CSV) could not be written: "+err.Error())
+		x.sum.CSV, csvPath = "not written (see above)", ""
+	}
 	x.sum.Title, x.sum.Source, x.sum.Dest, x.sum.Kind = "Copy", x.r.From, x.r.Dest, x.r.src.Kind()
-	x.sum.Took, x.sum.Profiles, x.sum.CSV = x.r.Now().Sub(start), x.r.inv.Profiles, csvPath
+	x.sum.Took, x.sum.Profiles = x.r.Now().Sub(start), x.r.inv.Profiles
 	x.sum.Backup = x.r.Backup
 	if x.sum.Backup == "" {
 		x.sum.Backup = "Custom"
 	}
 	x.sum.Excluded = map[string]int{}
-	for _, why := range x.r.excluded {
+	x.sum.Kept = x.counts["KEPT-FROM-EARLIER-RUN"]
+	for rel, why := range x.r.excluded {
+		if x.kept[rel] {
+			continue // kept from an earlier run, not excluded (shown as kept)
+		}
 		x.sum.Excluded[why]++
 	}
-	x.sum.Write(x.out, report.UniquePath(filepath.Join(dir, "copy_summary_"+stamp+".txt")))
+	if err := x.sum.Write(x.out, report.UniquePath(filepath.Join(dir, "copy_summary_"+stamp+".txt"))); err != nil {
+		errs = append(errs, fmt.Errorf("summary: %w", err))
+	}
+	return csvPath, errors.Join(errs...)
 }

@@ -56,14 +56,19 @@ type fake struct {
 	gone      bool
 	id        drives.Identity
 	listErr   map[string]error // folders that can't be listed (a damaged directory)
+	partList  map[string]error // folders listed only in part: the entries read plus this error
 }
 
 func (f *fake) ReadDir(name string) ([]fs.DirEntry, error) {
 	f.mu.Lock()
-	err := f.listErr[name]
+	err, perr := f.listErr[name], f.partList[name]
 	f.mu.Unlock()
 	if err != nil {
 		return nil, &fs.PathError{Op: "readdir", Path: name, Err: err}
+	}
+	if perr != nil {
+		es, _ := f.Source.ReadDir(name)
+		return es, &fs.PathError{Op: "readdir", Path: name, Err: perr}
 	}
 	return f.Source.ReadDir(name)
 }
@@ -145,7 +150,7 @@ func (p *prompter) ask(is job.Issue) job.Choice {
 func testDrives(src, dst string) func(string) (drives.Drive, error) {
 	return func(p string) (drives.Drive, error) {
 		if p == src {
-			return drives.Drive{Root: src, Removable: true, PhysicalID: "card", FS: "exFAT"}, nil
+			return drives.Drive{Root: src, Removable: true, PhysicalID: "card:" + src, FS: "exFAT"}, nil // unique: tests never share a disk lock
 		}
 		return drives.Drive{Root: filepath.VolumeName(dst) + `\`, PhysicalID: "disk", FS: "NTFS", Free: 1 << 40}, nil
 	}

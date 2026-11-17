@@ -114,7 +114,7 @@ func sysfsFixture() fstest.MapFS {
 }
 
 func TestParseSysfs(t *testing.T) {
-	devs := parseSysfs(sysfsFixture(), map[string]mount{"/dev/nvme0n1p2": {dev: "/dev/nvme0n1p2", dir: "/"}})
+	devs := parseSysfs(sysfsFixture(), map[string]mount{"/dev/nvme0n1p2": {dev: "/dev/nvme0n1p2", dir: "/"}}, "")
 	byPath := map[string]Device{}
 	for _, d := range devs {
 		byPath[d.Path] = d
@@ -140,7 +140,7 @@ func TestParseSysfs(t *testing.T) {
 }
 
 func TestDevicesIncludeUnmounted(t *testing.T) {
-	devs := parseSysfs(sysfsFixture(), nil)
+	devs := parseSysfs(sysfsFixture(), nil, "")
 	n := 0
 	for _, d := range devs {
 		if !d.Mounted {
@@ -280,7 +280,7 @@ func TestParseSysfsGateFacts(t *testing.T) {
 	devs := parseSysfs(fx, map[string]mount{
 		"/dev/nvme0n1p2": {dev: "/dev/nvme0n1p2", dir: "/", fs: "ext4"},
 		"/dev/sdb":       {dev: "/dev/sdb", dir: "/media/card", fs: "vfat"}, // a superfloppy card
-	})
+	}, "")
 	by := map[string]Device{}
 	for _, d := range devs {
 		by[d.Path] = d

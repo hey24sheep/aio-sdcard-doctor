@@ -11,7 +11,9 @@ import (
 )
 
 // Resuming needs proof it is the same card: with no readable fingerprint sample and no matching
-// file-system serial, a same-size card is refused instead of being mixed into the image.
+// file-system serial, a same-size card is not mixed into the image unless the user says it is
+// the same card (adversarial pass 3, SR3: it is asked, not called "a different card"; the safe
+// answer, and the one a run without a person gives, is Stop).
 func TestImageResumeWithoutFingerprintRefusesStranger(t *testing.T) {
 	data := devData(8 * MiB)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -36,7 +38,7 @@ func TestImageResumeWithoutFingerprintRefusesStranger(t *testing.T) {
 	other[100] ^= 0xFF
 	im2 := newImage(t, &fakeDev{r: faultreader.New(other, nil, faultreader.Options{}), size: int64(len(other))})
 	im2.Out = im.Out
-	if _, err := run(t, im2, context.Background()); err == nil || !strings.Contains(err.Error(), "different card") {
+	if _, err := run(t, im2, context.Background()); err == nil || !strings.Contains(err.Error(), "can't be checked") {
 		t.Fatalf("err = %v", err)
 	}
 }

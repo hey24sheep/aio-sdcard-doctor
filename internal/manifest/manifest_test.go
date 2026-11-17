@@ -15,6 +15,7 @@ import (
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/profile"
 )
 
 func TestMain(m *testing.M) { goleak.VerifyTestMain(m) }
@@ -147,4 +148,39 @@ func TestStoreCorruptRebuilds(t *testing.T) {
 func sha(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return strings.ToUpper(hex.EncodeToString(h[:]))
+}
+
+// The user's choice and the folder the copy was made from survive manifest.json, so a damaged
+// progress record rebuilt from it still offers the same choice and still tells which folder was
+// copied (OA4, SC6).
+func TestRebuildKeepsChoiceAndSourceRoot(t *testing.T) {
+	dir := t.TempDir()
+	s, m := open(t, filepath.Join(dir, "old.db"))
+	m.Volume = drives.Identity{FSSerial: "S1"}
+	m.SourceRoot = `E:\`
+	m.Backup, m.Types, m.Apps, m.SkipEmpty, m.Compress = "Quick", []profile.Category{profile.Photos}, []string{"whatsapp"}, true, true
+	m.Excluded = []string{"thumbnails"}
+	m.SaveMeta()
+	jsonPath := filepath.Join(dir, "manifest.json")
+	if err := m.ExportJSON(destfs.New(dir), jsonPath); err != nil {
+		t.Fatal(err)
+	}
+	s.Close()
+	b, _ := os.ReadFile(jsonPath)
+	if !strings.Contains(string(b), `"SourceRoot":"E:\\"`) {
+		t.Fatalf("manifest.json has no SourceRoot: %s", b)
+	}
+
+	s2, fresh := open(t, filepath.Join(dir, "state.db"))
+	defer s2.Close()
+	if _, err := Rebuild(fresh, jsonPath, dir); err != nil {
+		t.Fatal(err)
+	}
+	s2.Close()
+	s3, got := open(t, filepath.Join(dir, "state.db"))
+	defer s3.Close()
+	if got.SourceRoot != `E:\` || got.Backup != "Quick" || len(got.Types) != 1 || got.Types[0] != profile.Photos ||
+		len(got.Apps) != 1 || !got.SkipEmpty || !got.Compress || len(got.Excluded) != 1 {
+		t.Fatalf("not kept through Rebuild: %+v", got)
+	}
 }

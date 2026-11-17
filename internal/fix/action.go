@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"time"
 
@@ -80,7 +81,7 @@ func (f *Fix) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 			return p, nil
 		}
 	}
-	warns, err := Gate(t, GateInput{Op: f.Op, Verified: f.Verified, AllowFixed: f.AllowFixed, Admin: f.Admin(), BinaryDisk: f.BinaryDisk})
+	warns, err := Gate(t, GateInput{Ctx: ctx, Op: f.Op, Verified: f.Verified, AllowFixed: f.AllowFixed, Admin: f.Admin(), BinaryDisk: f.BinaryDisk})
 	var ref *Refused
 	switch {
 	case errors.As(err, &ref):
@@ -96,7 +97,11 @@ func (f *Fix) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 		return p, err
 	}
 	for _, w := range warns {
-		p.Issues = append(p.Issues, job.Issue{Kind: "not-verified", Severity: job.Warn, Title: "No verified rescue of this card",
+		kind, title := "not-verified", "No verified rescue of this card"
+		if strings.HasPrefix(w, uncheckedWarning) {
+			kind, title = "rescue-unchecked", "Couldn't look everywhere on this disk for a rescue"
+		}
+		p.Issues = append(p.Issues, job.Issue{Kind: kind, Severity: job.Warn, Title: title,
 			Detail: w, Choices: []job.Choice{job.Continue, job.Stop}, Default: job.Stop})
 	}
 	var argv []string
@@ -165,7 +170,34 @@ func (f *Fix) lockKey() string {
 	if drives.NormalizeSerial(f.Target.Vol.ID.FSSerial) != "" {
 		return f.Target.Vol.ID.LockKey()
 	}
+	return f.diskKey()
+}
+
+func (f *Fix) diskKey() string {
 	return drives.Identity{Size: uint64(f.Target.Disk.Size), PhysicalID: f.Target.Disk.PhysicalID}.LockKey()
+}
+
+// lockKeys are the card locks an operation takes. Every operation takes the physical disk's lock,
+// which every job reading the disk takes too: a card without a serial gets other keys from
+// imaging and recover (their content samples), so the disk is what they share (OA3). Repair,
+// format and the health test change the disk under every partition, so they also take every
+// partition's lock: a window imaging or rescuing any of them stops them.
+func (f *Fix) lockKeys() []string {
+	keys := []string{f.lockKey()}
+	if k := (drives.Identity{PhysicalID: f.Target.Disk.PhysicalID}).DiskLockKey(); k != "" {
+		keys = append(keys, k)
+	}
+	if f.Op == OpCheck {
+		return keys
+	}
+	keys = append(keys, f.diskKey())
+	for _, v := range f.Target.Disk.Volumes {
+		if drives.NormalizeSerial(v.ID.FSSerial) != "" {
+			keys = append(keys, v.ID.LockKey())
+		}
+	}
+	slices.Sort(keys)
+	return slices.Compact(keys)
 }
 
 // Run performs the operation.
@@ -173,11 +205,13 @@ func (f *Fix) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, err
 	f.defaults()
 	res := job.Result{Counters: map[string]int{}, Clean: true}
 	// one run per card (R14): never repair, format or test a card another window is reading
-	unlock, err := job.LockSource(f.lockKey())
-	if err != nil {
-		return res, err
+	for _, k := range f.lockKeys() {
+		unlock, err := job.LockSource(k)
+		if err != nil {
+			return res, err // the locks taken so far are released by the defers
+		}
+		defer unlock()
 	}
-	defer unlock()
 	if f.Op == OpHealth {
 		return f.health(ctx, env)
 	}
@@ -188,8 +222,16 @@ func (f *Fix) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, err
 	for try := 0; ; try++ {
 		var buf bytes.Buffer
 		err := Exec(ctx, argv, io.MultiWriter(f.Out, &buf))
+		waited := false
 		if ctx.Err() != nil {
-			return res, ctx.Err()
+			var ec interface{ ExitCode() int }
+			// on Windows a repair or format isn't stopped mid-write: Stop waits for it, and what it
+			// did is reported, not "stopped" (OA10)
+			if f.GOOS != "windows" || readOnlyTool(argv) || err != nil && !errors.As(err, &ec) {
+				return res, ctx.Err()
+			}
+			waited = true
+			env.Log("warn", "Stop waited for "+argv[0]+" to finish: stopping it in the middle of writing would damage the card")
 		}
 		code := 0
 		if err != nil {
@@ -203,7 +245,7 @@ func (f *Fix) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, err
 		if outcome == "fixed" && f.Op == OpRepair && argv[0] != "chkdsk" {
 			outcome = f.recheck(ctx, buf.String())
 		}
-		if outcome != "ok" && outcome != "fixed" && inUse(buf.String()) && try < 5 {
+		if outcome != "ok" && outcome != "fixed" && inUse(buf.String()) && try < 5 && !waited {
 			c := env.Prompt.Ask(ctx, job.Issue{Kind: "volume-in-use", Severity: job.Warn, Title: "Close programs using the card",
 				Detail:  "Close Explorer/Finder windows, photo apps and anything else open on the card, then retry.",
 				Choices: []job.Choice{job.Retry, job.Stop}, Default: job.Stop})
@@ -229,7 +271,8 @@ func (f *Fix) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, err
 
 // interpret reads an OS tool's exit code: chkdsk 0 none / 1 fixed / 2 cleanup / 3 couldn't
 // fix (or, without /f, errors found); fsck bit 1 corrected, 2 reboot, 4 left uncorrected,
-// 8+ operational error; diskutil, format and mkfs: 0 or failure.
+// 8+ operational error; diskutil verifyVolume: non-zero when it found problems; diskutil
+// repair and erase, format and mkfs: 0 or failure.
 func interpret(tool, op string, code int) string {
 	switch {
 	case tool == "chkdsk":
@@ -269,6 +312,9 @@ func interpret(tool, op string, code int) string {
 	}
 	if code == 0 {
 		return "ok"
+	}
+	if tool == "diskutil" && op == OpCheck { // verifyVolume exits non-zero when it finds problems
+		return "problems"
 	}
 	return "failed"
 }
@@ -315,7 +361,7 @@ func (f *Fix) health(ctx context.Context, env job.Env) (job.Result, error) {
 	opt.Restart = f.NewTest
 	opt.Reopen = func() (RW, error) {
 		closeOnce()
-		nt, err := f.findAgain()
+		nt, err := f.findAgain(ctx)
 		if err != nil {
 			return nil, err
 		}
@@ -354,9 +400,9 @@ func (f *Fix) health(ctx context.Context, env job.Env) (job.Result, error) {
 }
 
 // findAgain finds the card after a replug: same serial (or model) and size.
-func (f *Fix) findAgain() (Target, error) {
+func (f *Fix) findAgain(ctx context.Context) (Target, error) {
 	// the OS takes a few seconds to list a card plugged back in: wait for it, within reason
-	for start := time.Now(); ; time.Sleep(time.Second) {
+	for start := time.Now(); ; {
 		ds, err := f.ListDevices()
 		if err != nil {
 			return Target{}, err
@@ -369,6 +415,11 @@ func (f *Fix) findAgain() (Target, error) {
 		}
 		if time.Since(start) >= findAgainWait {
 			return Target{}, errors.New("the card isn't back yet — plug it in and run the same command again to continue")
+		}
+		select { // Stop doesn't wait for the card
+		case <-ctx.Done():
+			return Target{}, ctx.Err()
+		case <-time.After(time.Second):
 		}
 	}
 }

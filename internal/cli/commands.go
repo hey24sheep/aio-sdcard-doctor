@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/destfs"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/drives"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/fsread"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/imaging"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/preflight"
@@ -138,6 +140,96 @@ func isRawSource(from string) bool {
 	return err == nil && st.Mode().IsRegular()
 }
 
+// parseProfiles reads --profiles: auto (nil), or card layouts by name; a misspelt name is an
+// error, never silently dropped.
+func parseProfiles(s string) ([]string, error) {
+	if strings.TrimSpace(s) == "" || strings.EqualFold(strings.TrimSpace(s), "auto") {
+		return nil, nil
+	}
+	var known []string
+	for _, p := range profile.Builtin {
+		known = append(known, strings.ToLower(p.Name))
+	}
+	var out []string
+	for _, n := range strings.Split(s, ",") {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if n == "" {
+			continue
+		}
+		if !slices.Contains(known, n) {
+			return nil, fmt.Errorf("unknown card layout %q (use auto or: %s)", n, strings.Join(known, ", "))
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
+// volumeFlagCheck: --volume picks a partition of a card read directly; on a folder or a mounted
+// drive it would be ignored.
+func volumeFlagCheck(cmd *cobra.Command, raw bool, from string) error {
+	if cmd.Flags().Changed("volume") && !raw && !isRawSource(from) {
+		return exit(ExitUsage, "%s: --volume picks a partition when the card is read directly: add --raw, or name a device or image file", cmd.Name())
+	}
+	return nil
+}
+
+// partitionNote tells the user a card read directly has more partitions than the one read (one
+// per run), unless they picked it with --volume. Scan only: rescue's own plan says it, with "into
+// a new folder" (a rescue folder holds one partition's copy).
+func partitionNote(src any, picked bool, volume int) string {
+	v, ok := src.(interface{ Volumes() []fsread.Volume })
+	if !ok || picked || len(v.Volumes()) < 2 {
+		return ""
+	}
+	n := len(v.Volumes())
+	return fmt.Sprintf("Note: this card has %d partitions; only partition %d is read. To read another, run again with --volume N (0 to %d).\n",
+		n, volume+1, n-1)
+}
+
+// scanRoots are the paths a scan report must never be written into: the source itself and,
+// when it is a card, its volume and every mounted volume of the same physical disk (what rescue
+// protects too).
+func scanRoots(from string) []string {
+	roots := []string{from}
+	phys := ""
+	switch {
+	case rescue.IsDevicePath(from):
+		phys = drives.PhysicalOf(from)
+		if strings.HasPrefix(from, `\\.\`) && len(from) == 6 && from[5] == ':' { // \\.\E: is E:\
+			roots = append(roots, from[4:6]+`\`)
+		}
+	case !isRawSource(from): // a folder: its whole volume, when that volume is a card
+		if d, err := lookupDrive(from); err == nil && d.Removable && d.Root != "" {
+			roots = append(roots, d.Root)
+			phys = d.PhysicalID
+		}
+	}
+	if phys != "" {
+		if ds, err := drives.Lister(); err == nil {
+			for _, d := range ds {
+				if d.PhysicalID == phys && d.Root != "" {
+					roots = append(roots, d.Root)
+				}
+			}
+		}
+	}
+	return roots
+}
+
+// within: p is root or inside it, by where they really are (a junction, subst letter or
+// symbolic link can put a harmless-looking path on the card).
+func within(p, root string) bool {
+	norm := func(s string) string {
+		s = drives.RealPath(s)
+		if runtime.GOOS == "windows" || runtime.GOOS == "darwin" {
+			s = strings.ToLower(s)
+		}
+		return strings.TrimRight(s, `\/`)
+	}
+	p, root = norm(p), norm(root)
+	return p == root || strings.HasPrefix(p, root+string(filepath.Separator))
+}
+
 // --- scan -------------------------------------------------------------------------------------
 
 func scanCmd(io IO, g *globals) *cobra.Command {
@@ -163,6 +255,24 @@ func scanCmd(io IO, g *globals) *cobra.Command {
 			if raw {
 				from = rawSource(from)
 			}
+			if err := volumeFlagCheck(cmd, raw, from); err != nil {
+				return err
+			}
+			names, err := parseProfiles(profiles)
+			if err != nil {
+				return exit(ExitUsage, "scan: %v", err)
+			}
+			if to != "" {
+				if err := usableTo("scan", to, false); err != nil {
+					return err
+				}
+				to, _ = filepath.Abs(to)
+				for _, r := range scanRoots(from) {
+					if rescue.IsDevicePath(to) || !rescue.IsDevicePath(r) && within(to, r) {
+						return exit(ExitUsage, "scan: %s is on the card being scanned — choose a folder on another disk (the card is only ever read)", to)
+					}
+				}
+			}
 			raw = raw || isRawSource(from)
 			src, err := worker.Spawn(worker.Spec{From: from, Raw: raw, Volume: volume}, stall)
 			if errors.Is(err, source.ErrNeedsAdmin) {
@@ -172,25 +282,26 @@ func scanCmd(io IO, g *globals) *cobra.Command {
 				return exit(ExitError, "opening %s: %v", from, err)
 			}
 			defer src.Close()
+			src.SetContext(cmd.Context()) // Stop (Ctrl+C) ends a read stuck on the card
 			if msg := src.ReadError(); msg != "" {
 				return exit(ExitUsage, "%s: %s", from, msg)
 			}
 			active := profile.Detect(src)
-			if profiles != "" && profiles != "auto" {
-				active = profile.ByNames(strings.Split(profiles, ","))
+			if names != nil {
+				active = profile.ByNames(names)
 			}
 			inv, err := scan.Scan(cmd.Context(), src, active)
 			if err != nil {
 				return exit(ExitError, "%v", err)
 			}
-			text := scanSummary(from, src.Kind(), inv)
-			fmt.Fprint(io.Out, text)
+			text := partitionNote(src, cmd.Flags().Changed("volume"), volume) + scanSummary(from, src.Kind(), inv)
+			fmt.Fprint(io.Out, styleOf(io).report(text)) // the headings bold on a terminal; the saved summary stays plain
 			if to != "" {
-				csvPath, err := writeScan(to, from, inv, text)
+				csvPath, err := writeScan(to, scanRoots(from), inv, text)
 				if err != nil {
 					return exit(ExitError, "%v", err)
 				}
-				fmt.Fprintln(io.Out, "Report:", csvPath)
+				fmt.Fprintln(io.Out, "Report:", cleanText(csvPath))
 			}
 			return nil
 		},
@@ -232,10 +343,10 @@ func scanSummary(from, kind string, inv scan.Inventory) string {
 	}
 	for _, c := range profile.Priority {
 		if a := cats[c]; a != nil {
-			fmt.Fprintf(&b, "  %-18s %8d files  %12s\n", c, a.n, preflight.GB(a.b))
+			fmt.Fprintf(&b, "  %-18s %14s  %12s\n", c, preflight.Files(a.n), preflight.GB(a.b))
 		}
 	}
-	fmt.Fprintf(&b, "  %-18s %8d files  %12s\n\nTop folders by size:\n", "TOTAL", len(inv.Items), preflight.GB(total))
+	fmt.Fprintf(&b, "  %-18s %14s  %12s\n\nTop folders by size:\n", "TOTAL", preflight.Files(len(inv.Items)), preflight.GB(total))
 	var names []string
 	for n := range tops {
 		names = append(names, n)
@@ -245,7 +356,7 @@ func scanSummary(from, kind string, inv scan.Inventory) string {
 		if i == 25 {
 			break
 		}
-		fmt.Fprintf(&b, "  %-40s %7d files  %12s\n", n, tops[n].n, preflight.GB(tops[n].b))
+		fmt.Fprintf(&b, "  %-40s %13s  %12s\n", n, preflight.Files(tops[n].n), preflight.GB(tops[n].b))
 	}
 	b.WriteString("\nCould be skipped — only if you choose (rescue --exclude …):\n")
 	if len(inv.Suggested) == 0 {
@@ -258,7 +369,7 @@ func scanSummary(from, kind string, inv scan.Inventory) string {
 			if s.Recommended {
 				rec = "  (recommended)"
 			}
-			fmt.Fprintf(&b, "  %-18s %6d files %10s  %s%s\n", id, g.Files, preflight.GB(g.Bytes), s.Why, rec)
+			fmt.Fprintf(&b, "  %-18s %12s %10s  %s%s\n", id, preflight.Files(g.Files), preflight.GB(g.Bytes), s.Why, rec)
 		}
 	}
 	if len(inv.Links) > 0 {
@@ -271,13 +382,32 @@ func scanSummary(from, kind string, inv scan.Inventory) string {
 		}
 		b.WriteString("  " + u + "\n")
 	}
+	if strings.ContainsAny(from, " \t") { // pasted into a shell, a path with spaces must be quoted
+		from = `"` + from + `"`
+	}
 	b.WriteString("\nNext step: aio-sdcard-doctor rescue --from " + from + "\n")
-	return b.String()
+	return cleanLines(b.String()) // folder names and paths come from the card: none reaches the terminal raw
 }
 
-func writeScan(to, from string, inv scan.Inventory, text string) (string, error) {
+// usableTo turns a --to the write guard couldn't use (stray quotes, "aux", "a:b") into a usage
+// error that says why, before filepath.Abs hides it and long before anything is written (SU1).
+// For image, --to is a file: its folder is checked.
+func usableTo(cmd, to string, file bool) error {
+	if to == "" {
+		return nil
+	}
+	if file {
+		to = filepath.Dir(to)
+	}
+	if err := destfs.CheckRoot(to); err != nil {
+		return exit(ExitUsage, "%s: %v", cmd, err)
+	}
+	return nil
+}
+
+func writeScan(to string, roots []string, inv scan.Inventory, text string) (string, error) {
 	reports := filepath.Join(to, "Reports")
-	out := destfs.New(to, from)
+	out := destfs.New(to, roots...)
 	if err := out.MkdirAll(reports); err != nil {
 		return "", err
 	}
@@ -287,8 +417,9 @@ func writeScan(to, from string, inv scan.Inventory, text string) (string, error)
 	w := csv.NewWriter(&buf)
 	w.Write([]string{"Category", "Top", "Path", "Bytes", "Modified", "Suggestion", "Fragment"})
 	for _, it := range inv.Items {
-		w.Write([]string{string(it.Cat), path.Dir(it.Rel), it.Rel, strconv.FormatInt(it.Size, 10),
-			it.MTime.Format("2006-01-02 15:04:05"), it.Suggest, strconv.FormatBool(it.Fragment)})
+		// names come from the card: never a formula when the report is opened in a spreadsheet
+		w.Write([]string{string(it.Cat), report.Cell(path.Dir(it.Rel)), report.Cell(it.Rel), strconv.FormatInt(it.Size, 10),
+			it.MTime.Format("2006-01-02 15:04:05"), report.Cell(it.Suggest), strconv.FormatBool(it.Fragment)})
 	}
 	w.Flush()
 	csvPath := report.UniquePath(filepath.Join(reports, "scan_"+stamp+".csv"))
@@ -307,7 +438,7 @@ func rescueCmd(io IO, g *globals) *cobra.Command {
 	var volume int
 	stall, wait := 30*time.Second, 10*time.Minute
 	c := &cobra.Command{
-		Use:   "rescue --from E: --to DIR --backup quick|standard|full|…",
+		Use:   "rescue --from E: [--to DIR] --backup quick|standard|full|…",
 		Short: "Copy the files you choose off the card (bad areas zero-filled and marked __PARTIAL)",
 		Long: "Copy the files you choose off the card, most precious first. The card is only read.\n" +
 			"Choose with --backup (quick, standard, full, photos, videos, music, documents, whatsapp, telegram)\n" +
@@ -364,17 +495,28 @@ func rescueCmd(io IO, g *globals) *cobra.Command {
 			if raw {
 				from = rawSource(from)
 			}
+			if err := volumeFlagCheck(cmd, raw, from); err != nil {
+				return err
+			}
+			names, err := parseProfiles(profiles)
+			if err != nil {
+				return exit(ExitUsage, "rescue: %v", err)
+			}
+			if err := usableTo("rescue", to, false); err != nil {
+				return err
+			}
 			to, _ = filepath.Abs(to)
 			if !cmd.Flags().Changed("wait-timeout") {
 				wait = waitTimeout(io)
 			}
-			r := &rescue.Rescue{From: from, Raw: raw || isRawSource(from), Volume: volume, Dest: to,
-				Compress: compress, Fresh: startOver, Interactive: io.TTY, StallTimeout: stall, WaitTimeout: wait,
-				LookupDrive: lookupDrive, OpenSource: openSource}
+			// The plan notes a card with more partitions than the one copied (VolumePicked silences it).
+			r := &rescue.Rescue{From: from, Raw: raw || isRawSource(from), Volume: volume, VolumePicked: fl.Changed("volume"),
+				Dest: to, Compress: compress, Fresh: startOver, Interactive: io.TTY, StallTimeout: stall, WaitTimeout: wait,
+				LookupDrive: lookupDrive, OpenSource: func(s worker.Spec, stall time.Duration) (rescue.Source, error) {
+					return openSource(s, stall)
+				}}
 			applySelection(r, sel)
-			if profiles != "" && profiles != "auto" {
-				r.Profiles = strings.Split(profiles, ",")
-			}
+			r.Profiles = names
 			env := g.env(io)
 			ctx := cmd.Context()
 			plan, err := r.Plan(ctx, env)
@@ -457,6 +599,18 @@ func deviceFor(from string) string {
 	return "/dev/" + d.PhysicalID
 }
 
+// imageSource: an image is of a whole card — a drive (its root), a device or an image file —
+// never of a folder, which would image the whole disk the folder is on (SU6).
+func imageSource(from string) error {
+	if isRawSource(from) {
+		return nil
+	}
+	if d, err := lookupDrive(from); err == nil && sameRoot(from, d.Root) {
+		return nil
+	}
+	return exit(ExitUsage, "image: --from takes the card itself (a drive such as E:, a mount point or a device), not a folder (%s) — copy a folder's files with rescue", cleanText(from))
+}
+
 func imageCmd(io IO, g *globals) *cobra.Command {
 	var from, to string
 	var retries int
@@ -482,6 +636,15 @@ func imageCmd(io IO, g *globals) *cobra.Command {
 			if retries < 0 || retries > 5 {
 				return exit(ExitUsage, "image: --retry-passes must be 0–5")
 			}
+			if keepRaw && !compress {
+				return exit(ExitUsage, "image: --keep-raw goes with --compress (without it the image is kept as it is)")
+			}
+			if err := imageSource(normFrom(from)); err != nil {
+				return err
+			}
+			if err := usableTo("image", to, true); err != nil {
+				return err
+			}
 			to, _ = filepath.Abs(to)
 			im := &imaging.Image{Device: deviceFor(normFrom(from)), Out: to, RetryPasses: retries, Compress: compress, KeepRaw: keepRaw,
 				StallTimeout: stall, WaitTimeout: waitTimeout(io)}
@@ -491,7 +654,7 @@ func imageCmd(io IO, g *globals) *cobra.Command {
 				}
 			})
 			if err == nil {
-				fmt.Fprintf(io.Out, "\nNext: rescue --from %q (no admin needed), or verify --image %q\n", to, to)
+				fmt.Fprint(io.Out, styleOf(io).report(imageNext(to, compress, keepRaw)))
 			}
 			return err
 		},
@@ -541,4 +704,14 @@ func verifyCmd(io IO, g *globals) *cobra.Command {
 	f.BoolVar(&restart, "restart", false, "check every file again instead of resuming")
 	f.BoolVar(&g.yes, "yes", false, "accept warnings without asking")
 	return c
+}
+
+// imageNext is the next step after an image: rescue reads card.img, not card.img.xz (which is
+// all that is left after --compress without --keep-raw).
+func imageNext(to string, compress, keepRaw bool) string {
+	if compress && !keepRaw {
+		return fmt.Sprintf("\nNext: verify --image \"%s\". To rescue files from it, decompress it to %s first (7-Zip, xz -dk), "+
+			"or use --keep-raw next time.\n", to+".xz", filepath.Base(to))
+	}
+	return fmt.Sprintf("\nNext: rescue --from \"%s\" (no admin needed), or verify --image \"%s\"\n", to, to)
 }

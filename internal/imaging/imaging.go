@@ -73,6 +73,9 @@ type Image struct {
 // errDifferentCard: the device that came back is not the card being imaged (R2: no override).
 var errDifferentCard = errors.New("this looks like a different card than the one in the image (content differs) — start a new image")
 
+// errUnverified: nothing could be compared, and the user didn't choose to go on.
+var errUnverified = errors.New("stopped: this card can't be checked against the one the image was started on — if it is the same card, run again and choose Continue; otherwise start a new image")
+
 func (im *Image) Name() string { return "image" }
 
 func (im *Image) defaults() {
@@ -156,15 +159,28 @@ func (im *Image) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	_, outErr := os.Stat(im.Out)
 	switch {
 	case mapErr == nil && outErr == nil:
-		if m, err := loadMap(im.mapPath()); err == nil {
+		if m, err := loadMap(im.mapPath(), im.size); err == nil {
 			in.Resume = &job.ResumeInfo{Done: int(m.Bytes(Finished) >> 20), Total: int(im.size >> 20)}
 			if m.Size() != im.size {
 				p.Issues = append(p.Issues, job.Issue{Kind: "image-other-card", Severity: job.Block,
 					Title: "The existing image is of a different card (size differs)", Detail: "Choose a new image name.",
 					Choices: []job.Choice{job.Stop}, Default: job.Stop})
 			}
+		} else {
+			p.Issues = append(p.Issues, job.Issue{Kind: "image-map-unreadable", Severity: job.Block,
+				Title:   "The image's progress file can't be read: " + err.Error(),
+				Detail:  fmt.Sprintf("Choose a new image name, or move %s and %s away to start over — nothing is overwritten.", im.Out, im.mapPath()),
+				Choices: []job.Choice{job.Stop}, Default: job.Stop})
 		}
 		in.DeviceSize = 0 // the image file already exists at full size
+	case mapErr == nil:
+		why := fmt.Sprintf("Choose a new image name, or delete %s to start fresh.", im.mapPath())
+		if _, err := os.Stat(im.Out + ".xz"); err == nil {
+			why = fmt.Sprintf("%s.xz is a finished compressed image, which can't be resumed. %s", im.Out, why)
+		}
+		p.Issues = append(p.Issues, job.Issue{Kind: "image-map-left", Severity: job.Block,
+			Title: "The image file is missing but its progress file is still there", Detail: why,
+			Choices: []job.Choice{job.Stop}, Default: job.Stop})
 	case outErr == nil:
 		p.Issues = append(p.Issues, job.Issue{Kind: "image-exists", Severity: job.Block,
 			Title: "A file with this name already exists", Detail: "Choose a new image name — nothing is overwritten.",
@@ -205,12 +221,12 @@ func (im *Image) Plan(ctx context.Context, env job.Env) (job.Plan, error) {
 	return p, nil
 }
 
-func loadMap(p string) (*Mapfile, error) {
+func loadMap(p string, size int64) (*Mapfile, error) {
 	b, err := readOrBak(p)
 	if err != nil {
 		return nil, err
 	}
-	return ParseMapfile(bytes.NewReader(b))
+	return parseMapfile(bytes.NewReader(b), mapLines(size))
 }
 
 // readOrBak reads p, or the p.bak a save leaves for a moment (renamed aside before the new file
@@ -239,7 +255,8 @@ func (im *Image) save(out destfs.FS, m *Mapfile, meta *Meta) error {
 }
 
 func isFatal(err error) bool {
-	return errors.Is(err, source.ErrTooManyRestarts) || errors.Is(err, context.Canceled) || errors.Is(err, errDifferentCard)
+	return errors.Is(err, source.ErrTooManyRestarts) || errors.Is(err, context.Canceled) || errors.Is(err, errDifferentCard) ||
+		errors.Is(err, errUnverified)
 }
 
 // Run images the card (or resumes).
@@ -274,6 +291,16 @@ func (im *Image) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		return job.Result{}, err
 	}
 	defer unlock()
+	if k := id.DiskLockKey(); k != "" { // and the disk's, which every job on it takes (OA3)
+		unlockDisk, err := job.LockSource(k)
+		if err != nil {
+			return job.Result{}, err
+		}
+		defer unlockDisk()
+	}
+	if c, ok := im.dev.(interface{ SetContext(context.Context) }); ok {
+		c.SetContext(ctx) // every reader call (reads, a respawn) ends on Stop
+	}
 	if release, err := job.Inhibit("imaging a card"); err == nil {
 		defer release()
 	}
@@ -281,7 +308,7 @@ func (im *Image) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 		destSerial: drives.VolumeSerial(filepath.Dir(im.Out)),
 		thr:        job.Throttle{Every: 100 * time.Millisecond}}
 	resume := false
-	if m, err := loadMap(im.mapPath()); err == nil {
+	if m, err := loadMap(im.mapPath(), im.size); err == nil {
 		x.m, resume = m, true
 		x.meta = &Meta{}
 		if b, err := readOrBak(im.metaPath()); err == nil {
@@ -297,10 +324,9 @@ func (im *Image) Run(ctx context.Context, env job.Env, p job.Plan) (job.Result, 
 	}
 	x.img = img
 	if resume {
-		ok, err := x.fingerprintMatches()
-		if err != nil || !ok {
+		if err := x.sameCard(); err != nil {
 			img.Close()
-			return job.Result{}, errDifferentCard
+			return job.Result{}, err
 		}
 	}
 	x.saved = im.Now()

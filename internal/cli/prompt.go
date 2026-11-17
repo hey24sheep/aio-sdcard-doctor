@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/preflight"
+	"github.com/hey24sheep/aio-sdcard-doctor/internal/tui"
 )
 
 var choiceText = map[job.Choice]string{
@@ -83,10 +86,14 @@ func (p *ttyPrompter) Ask(ctx context.Context, is job.Issue) job.Choice {
 	if len(is.Choices) == 0 {
 		return is.Default
 	}
-	w := p.io.Err
-	fmt.Fprintf(w, "\n%s\n", is.Title)
+	w, st := p.io.Err, styleOf(p.io)
+	title := cleanText(is.Title) // titles and details name the card's files
+	if st.on() {
+		title = st.status("risk", title)
+	}
+	fmt.Fprintf(w, "\n%s\n", title)
 	if is.Detail != "" {
-		fmt.Fprintf(w, "  %s\n", is.Detail)
+		fmt.Fprintf(w, "  %s\n", cleanText(is.Detail))
 	}
 	def := 1
 	for i, c := range is.Choices {
@@ -94,14 +101,17 @@ func (p *ttyPrompter) Ask(ctx context.Context, is job.Issue) job.Choice {
 		if c == is.Default {
 			mark, def = " (default)", i+1
 		}
-		fmt.Fprintf(w, "  %d) %s%s\n", i+1, label(c), mark)
+		fmt.Fprintf(w, "  %s %s%s\n", st.paint("signal", true, fmt.Sprintf("%d)", i+1)), label(c), st.dim(mark))
 	}
 	for {
 		fmt.Fprintf(w, "Choose 1-%d [%d]: ", len(is.Choices), def)
 		a, ok := readAnswer(ctx, p.io.In)
 		switch {
-		case !ok:
-			return job.Stop
+		case !ok: // Ctrl+C or the terminal closed: the safe answer, as Esc in the windows
+			if slices.Contains(is.Choices, job.Stop) {
+				return job.Stop
+			}
+			return is.Default
 		case a == "":
 			return is.Choices[def-1]
 		}
@@ -112,27 +122,41 @@ func (p *ttyPrompter) Ask(ctx context.Context, is job.Issue) job.Choice {
 	}
 }
 
-// printer writes progress at most once a second plus one line per problem file.
+// printer writes progress at most once a second plus one line per problem file. On a person's
+// terminal (a Look) the progress is one line redrawn in place, and a problem line is printed
+// above it.
 type printer struct {
 	io    IO
 	plain bool
 	mu    sync.Mutex
 	last  time.Time
 	shown bool
+	line  string // the live line on screen (a Look)
 }
 
 func (p *printer) progress(pr job.Progress) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if time.Since(p.last) < time.Second {
+	// at most once a second — and always the last one, so a finished run never ends on "0%"
+	st := styleOf(p.io)
+	every := time.Second
+	if st.on() && !p.plain {
+		every = redrawEvery
+	}
+	if done := pr.Total > 0 && pr.Done >= pr.Total; !done && time.Since(p.last) < every {
 		return
 	}
 	p.last = time.Now()
+	if st.on() && !p.plain {
+		p.line = st.progressLine(pr, st.width())
+		p.redraw()
+		return
+	}
 	pct := 0.0
 	if pr.Total > 0 {
 		pct = 100 * float64(pr.Done) / float64(pr.Total)
 	}
-	line := fmt.Sprintf("%s  %3.0f%%  %s / %s  %s", pr.Phase, pct, gb(pr.Done), gb(pr.Total), shorten(pr.Item, 50))
+	line := fmt.Sprintf("%s  %3.0f%%  %s / %s  %s", cleanText(pr.Phase), pct, preflight.GB(pr.Done), preflight.GB(pr.Total), shorten(cleanText(pr.Item), 50))
 	if p.plain {
 		fmt.Fprintln(p.io.Out, line)
 	} else {
@@ -144,6 +168,16 @@ func (p *printer) progress(pr job.Progress) {
 func (p *printer) log(level, msg string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	msg = cleanText(msg) // log lines name the card's files
+	if st := styleOf(p.io); st.on() && !p.plain && p.shown {
+		fmt.Fprint(p.io.Out, p.clear()) // the problem above, the live line again below it
+		if level == "warn" {
+			msg = "  " + st.paint("risk", false, tui.Symbol("risk", st.ascii())+" "+msg)
+		}
+		fmt.Fprintln(p.io.Out, msg)
+		p.redraw()
+		return
+	}
 	if p.shown {
 		fmt.Fprintln(p.io.Out)
 		p.shown = false
@@ -155,20 +189,24 @@ func (p *printer) log(level, msg string) {
 	}
 }
 
+// redraw puts the live line on screen in place of the last one.
+func (p *printer) redraw() {
+	fmt.Fprint(p.io.Out, p.clear()+p.line)
+	p.shown = true
+}
+
+// clear returns to the start of the live line and blanks it.
+func (p *printer) clear() string {
+	if p.io.Look != nil && p.io.Look.VT {
+		return "\r\x1b[K"
+	}
+	return "\r" + strings.Repeat(" ", max(0, styleOf(p.io).width()-1)) + "\r"
+}
+
 func shorten(s string, n int) string {
 	r := []rune(s)
 	if len(r) <= n {
 		return s
 	}
 	return "…" + string(r[len(r)-n+1:])
-}
-
-func gb(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.2f GB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
-	}
-	return fmt.Sprintf("%d KB", n>>10)
 }

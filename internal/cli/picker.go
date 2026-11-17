@@ -35,7 +35,7 @@ func driveLine(d drives.Drive) string {
 	if len(tags) > 0 {
 		t = " (" + strings.Join(tags, ", ") + ")"
 	}
-	return fmt.Sprintf("%-12s %-14s %-6s %10s  %s%s", d.Root, d.Label, d.FS, preflight.GB(int64(d.Total)), kind, t)
+	return fmt.Sprintf("%-12s %-14s %-6s %10s  %s%s", cleanText(d.Root), cleanText(d.Label), cleanText(d.FS), preflight.GB(int64(d.Total)), kind, t)
 }
 
 // sortDrives puts cards and USB drives first.
@@ -72,16 +72,20 @@ func pickSource(ctx context.Context, io IO, purpose string) (string, error) {
 		}
 		sortDrives(ds)
 		hasCard := len(ds) > 0 && ds[0].Removable
-		fmt.Fprintf(io.Err, "\nWhich drive should be %s?\n", purpose)
+		st := styleOf(io)
+		fmt.Fprintf(io.Err, "\n%s\n", st.head(fmt.Sprintf("Which drive should be %s?", purpose)))
 		if !hasCard {
-			fmt.Fprintln(io.Err, "  No card or USB drive was found. Insert it and press Enter to look again,")
+			fmt.Fprintln(io.Err, "  "+st.status("risk", "No card or USB drive was found.")+" Insert it and press Enter to look again,")
 			fmt.Fprintln(io.Err, "  or copy from an internal drive or a folder below.")
 		}
+		if st.on() && len(ds) > 0 { // a table: the column names over the columns
+			fmt.Fprintln(io.Err, st.dim(fmt.Sprintf("      %-12s %-14s %-6s %10s  %s", "Drive", "Name", "Type", "Size", "Kind")))
+		}
 		for i, d := range ds {
-			fmt.Fprintf(io.Err, "  %2d) %s\n", i+1, driveLine(d))
+			fmt.Fprintf(io.Err, "  %s %s\n", st.paint("signal", true, fmt.Sprintf("%2d)", i+1)), driveLine(d))
 		}
 		typeIt := len(ds) + 1
-		fmt.Fprintf(io.Err, "  %2d) Type a folder or card image file\n", typeIt)
+		fmt.Fprintf(io.Err, "  %s Type a folder or card image file\n", st.paint("signal", true, fmt.Sprintf("%2d)", typeIt)))
 		def := 0
 		if hasCard {
 			def = 1

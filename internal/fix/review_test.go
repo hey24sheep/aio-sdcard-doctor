@@ -275,11 +275,11 @@ func TestHasRescueFindsImagesAndDeeperRescues(t *testing.T) {
 	os.MkdirAll(rep, 0o755)
 	os.WriteFile(filepath.Join(rep, "state.db"), nil, 0o644)
 	for name, root := range map[string]string{"image": img, "two folders down": deep} {
-		if !HasRescue(root) {
+		if found, _ := HasRescue(root); !found {
 			t.Errorf("%s: not seen as holding a rescue", name)
 		}
 	}
-	if HasRescue(t.TempDir()) {
+	if found, _ := HasRescue(t.TempDir()); found {
 		t.Error("an empty disk holds a rescue")
 	}
 }

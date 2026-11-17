@@ -1,6 +1,6 @@
 // Package drives lists volumes and physical disks with what the safety checks need: removable,
 // system, locked, write-protected, RAW, physical-disk id and a card identity that survives a
-// re-plug. Nothing here reads card data.
+// re-plug. Nothing here reads card data, except one boot sector on macOS for its serial.
 package drives
 
 import (
@@ -61,12 +61,37 @@ func (a Identity) LockKey() string {
 	return hex.EncodeToString(s[:])
 }
 
+// DiskLockKey is a second lock every job that reads or writes a physical disk takes, so a card
+// without a serial is locked the same way whatever identity each job worked out for it (OA3):
+// "" when the physical disk isn't known (an image file, a folder).
+func (a Identity) DiskLockKey() string {
+	if a.PhysicalID == "" {
+		return ""
+	}
+	s := sha256.Sum256([]byte("physical:" + strings.ToLower(a.PhysicalID)))
+	return hex.EncodeToString(s[:])
+}
+
 // Matches reports whether b is the same card as a. When both know the file-system serial it
 // decides (sizes differ between a volume and its disk); otherwise sizes must agree. Model and
 // DeviceSerial are ignored because on USB readers they describe the reader. Fingerprint blocks
 // unreadable on either side are skipped; at least 3 must match (or all, when fewer can be
-// compared) and none may differ.
+// compared) and none may differ. Without two serials the samples decide, so at least one must
+// be compared: a card whose file system read once and not the other time, or a manifest that
+// recorded nothing, is not vouched for by its size alone (OA1). Only a samples-only comparison
+// (neither side has a serial or a size, as imaging compares its own blocks) leaves "nothing
+// comparable" to the caller.
 func (a Identity) Matches(b Identity) (ok bool, matched, compared int) {
+	ok, matched, compared = a.matches(b)
+	sa, sb := NormalizeSerial(a.FSSerial), NormalizeSerial(b.FSSerial)
+	samplesOnly := sa == "" && sb == "" && a.Size == 0 && b.Size == 0
+	if ok && compared == 0 && (sa == "" || sb == "") && !samplesOnly {
+		return false, matched, compared
+	}
+	return ok, matched, compared
+}
+
+func (a Identity) matches(b Identity) (ok bool, matched, compared int) {
 	sa, sb := NormalizeSerial(a.FSSerial), NormalizeSerial(b.FSSerial)
 	switch {
 	case sa != "" && sb != "":

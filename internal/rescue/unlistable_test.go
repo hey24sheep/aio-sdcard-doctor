@@ -61,3 +61,25 @@ func TestFolderListedLaterDropsItsFailedRow(t *testing.T) {
 		t.Fatalf("file %+v clean %v", e, res.Clean)
 	}
 }
+
+// OR1: a folder the card lists only in part (one bad sector): the files it did list are copied,
+// and the folder is still reported, so the run isn't clean.
+func TestPartlyListedFolderCopiesWhatWasListed(t *testing.T) {
+	src := testutil.WriteFolder(t, testutil.Card{"DCIM/100BROKE/a.jpg": {Data: testutil.JPEG(2000, "a")}, "DCIM/100BROKE/b.jpg": {Data: testutil.JPEG(2000, "b")}})
+	dst := filepath.Join(t.TempDir(), "out")
+	f := newFake(t, src)
+	f.partList = map[string]error{"DCIM/100BROKE": errors.New("I/O error")}
+	r := newRescue(src, dst, f)
+	r.Types = nil
+	res, err := do(t, r, nil, destfs.New(dst, src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	es := entries(t, dst)
+	if es["DCIM/100BROKE/a.jpg"].Status != manifest.OK || es["DCIM/100BROKE/b.jpg"].Status != manifest.OK {
+		t.Fatalf("listed files not copied: %+v", es)
+	}
+	if e := es["DCIM/100BROKE/"]; e.Status != manifest.FAILED || !strings.Contains(e.Error, "could not be listed") || res.Clean {
+		t.Fatalf("folder row %+v clean %v", e, res.Clean)
+	}
+}

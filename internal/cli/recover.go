@@ -93,6 +93,9 @@ func recoverCmd(io IO, g *globals) *cobra.Command {
 					return exit(ExitUsage, "recover: --select %s lists nothing", selectFile)
 				}
 			}
+			if err := usableTo("recover", to, false); err != nil {
+				return err
+			}
 			to, _ = filepath.Abs(to)
 			r := &recovery.Recover{From: rawSource(normFrom(from)), Dest: to, Types: ts, MinSize: minBytes, SkipRescued: skipRescued,
 				NoUndelete: noUndelete, Deep: deep, Thorough: thorough, States: sts, Select: sel, List: list, Flat: flat,

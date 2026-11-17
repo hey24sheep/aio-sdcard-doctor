@@ -101,7 +101,11 @@ func List() ([]Drive, error) {
 			continue
 		}
 		letter := string(rune('A' + i))
-		if d, ok := volume(letter, sysDrive); ok {
+		d, ok, answered := probeWithin(letter, probeTimeout, func() (Drive, bool) { return volume(letter, sysDrive) })
+		switch {
+		case !answered: // a dying card that doesn't answer: listed, never waited for
+			out = append(out, notResponding(letter+`:\`, `\\.\`+letter+":"))
+		case ok:
 			out = append(out, d)
 		}
 	}
@@ -189,7 +193,12 @@ func ListDevices() ([]Device, error) {
 	}
 	byDisk := map[string][]Drive{}
 	for _, v := range vols {
-		for _, n := range volumeDisks(v.Root[:1]) {
+		if v.FS == notRespondingFS {
+			continue // asking it which disk it is on would hang too
+		}
+		letter := v.Root[:1]
+		ns, _, _ := probeWithin("extents:"+letter, probeTimeout, func() ([]uint32, bool) { return volumeDisks(letter), true })
+		for _, n := range ns {
 			id := fmt.Sprintf("PhysicalDrive%d", n)
 			byDisk[id] = append(byDisk[id], v)
 		}
@@ -197,21 +206,34 @@ func ListDevices() ([]Device, error) {
 	var out []Device
 	for i := 0; i < 64; i++ {
 		id := fmt.Sprintf("PhysicalDrive%d", i)
-		h, err := openQuery(`\\.\` + id)
-		if err != nil {
+		dev, ok, answered := probeWithin("disk:"+id, probeTimeout, func() (Device, bool) { return disk(id) })
+		switch {
+		case !answered: // listed with what is known without asking it: its size unknown
+			dev = Device{Path: `\\.\` + id, PhysicalID: id}
+		case !ok:
 			continue
 		}
-		dev := Device{Path: `\\.\` + id, PhysicalID: id, Size: diskLength(h), Volumes: byDisk[id]}
-		if desc, err := queryDescriptor(h); err == nil {
-			dev.Model, dev.Serial, dev.Bus = desc.model, desc.serial, desc.bus
-			dev.Removable = desc.removable || desc.bus == "sd" || desc.bus == "mmc"
-		}
-		if _, err := ioctl(h, ioctlDiskIsWritable, nil, nil); errors.Is(err, windows.ERROR_WRITE_PROTECT) {
-			dev.ReadOnly = true
-		}
-		windows.CloseHandle(h)
+		dev.Volumes = byDisk[id]
 		dev.Mounted = len(dev.Volumes) > 0
 		out = append(out, dev)
 	}
 	return out, nil
+}
+
+// disk describes one physical disk (false: there is none with that number).
+func disk(id string) (Device, bool) {
+	h, err := openQuery(`\\.\` + id)
+	if err != nil {
+		return Device{}, false
+	}
+	defer windows.CloseHandle(h)
+	dev := Device{Path: `\\.\` + id, PhysicalID: id, Size: diskLength(h)}
+	if desc, err := queryDescriptor(h); err == nil {
+		dev.Model, dev.Serial, dev.Bus = desc.model, desc.serial, desc.bus
+		dev.Removable = desc.removable || desc.bus == "sd" || desc.bus == "mmc"
+	}
+	if _, err := ioctl(h, ioctlDiskIsWritable, nil, nil); errors.Is(err, windows.ERROR_WRITE_PROTECT) {
+		dev.ReadOnly = true
+	}
+	return dev, true
 }

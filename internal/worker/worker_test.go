@@ -24,9 +24,13 @@ import (
 const (
 	envWorker = "AIO_TEST_WORKER" // this test binary acts as the worker
 	envParent = "AIO_TEST_PARENT" // this test binary acts as a parent that gets killed
+	envHang   = "AIO_TEST_HANG"   // this test binary acts as a worker that never answers
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv(envHang) == "1" {
+		time.Sleep(time.Hour) // killed by the test's Stop
+	}
 	if os.Getenv(envWorker) == "1" {
 		os.Exit(Main())
 	}

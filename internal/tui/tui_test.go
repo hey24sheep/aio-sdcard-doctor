@@ -343,7 +343,7 @@ func TestRecoverListTick(t *testing.T) {
 }
 
 func TestViewFitsEverySize(t *testing.T) {
-	for _, sz := range [][2]int{{80, 24}, {120, 40}, {200, 50}} {
+	for _, sz := range [][2]int{{60, 20}, {80, 24}, {120, 40}, {200, 50}} {
 		r := newRig(t)
 		r.size(sz[0], sz[1])
 		check := func(where string) {
@@ -370,8 +370,10 @@ func TestViewFitsEverySize(t *testing.T) {
 
 func TestSmallTerminalMessage(t *testing.T) {
 	r := newRig(t)
-	r.size(60, 20)
-	r.want(t, "at least 80×24")
+	r.size(59, 20)
+	r.want(t, "at least 60×20")
+	r.size(60, 20) // the smallest laid-out screen
+	r.want(t, "Choose the card", "CAMERA")
 }
 
 func TestASCIIMode(t *testing.T) {

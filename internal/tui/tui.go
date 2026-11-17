@@ -4,16 +4,12 @@
 package tui
 
 import (
-	"fmt"
 	"os"
 	"slices"
-	"sort"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/app"
 	"github.com/hey24sheep/aio-sdcard-doctor/internal/job"
@@ -40,17 +36,26 @@ type Model struct {
 	item     int // options: which text option is being typed
 	flash    string
 	accept   bool
+	warns    string // the warnings accept was ticked for
 	label    string
 	size     string
 	field    int // 0 none, 1 label, 2 size (card tools confirmation)
 	stopAsk  bool
+	leaveAsk string // the key ("n" start over, "q" quit) waiting for "Leave the list? y/n"
 	issueID  string // the question issueSel belongs to
 	issueSel int
 	help     bool
 	bellFor  string
 
 	cursorLine int // set while drawing: the line of the highlighted row (for scrolling)
+	inner      int // set while drawing: the panel's text width
+
+	speeds     []float64 // recent speeds of this run, for the sparkline
+	lastSample time.Time
 }
+
+// sampleEvery spaces the speed samples (a test draws a run without waiting).
+var sampleEvery = time.Second
 
 type viewMsg struct{}
 type tickMsg struct{}
@@ -100,8 +105,9 @@ func (m *Model) refresh() {
 	m.v = cleanView(m.s.View()) // card text can't break the screen or reach the terminal
 	if m.v.Step != m.lastStep {
 		m.lastStep = m.v.Step
-		m.cur, m.typing, m.accept, m.field, m.label, m.size, m.stopAsk = 0, false, false, 0, "", "", false
+		m.cur, m.typing, m.accept, m.field, m.label, m.size, m.stopAsk, m.leaveAsk = 0, false, false, 0, "", "", false, ""
 		m.text = ""
+		m.speeds = nil
 		if m.v.Step == app.StepDest {
 			m.text, m.typing = m.v.Req.Dest, true
 		}
@@ -109,11 +115,23 @@ func (m *Model) refresh() {
 			m.text = m.v.Recover.Filter
 		}
 	}
+	if pr := m.v.Progress; m.v.Step == app.StepRun && pr != nil && pr.BPS > 0 && time.Since(m.lastSample) >= sampleEvery {
+		m.speeds = append(m.speeds, pr.BPS)
+		if len(m.speeds) > 240 {
+			m.speeds = m.speeds[len(m.speeds)-240:]
+		}
+		m.lastSample = time.Now()
+	}
+	if m.v.Plan != nil { // checked again on the same page (Start over): new warnings need a new tick
+		if w := warnKey(m.v.Plan); w != m.warns {
+			m.warns, m.accept = w, false
+		}
+	}
 	if m.v.Issue == nil {
 		m.issueSel, m.issueID = 0, ""
 	} else {
-		m.stopAsk = false              // the engine's question comes first, and must be on screen to be answered
-		if m.v.Issue.ID != m.issueID { // a new question starts on its default, as the GUI does
+		m.stopAsk, m.leaveAsk = false, "" // the engine's question comes first, and must be on screen to be answered
+		if m.v.Issue.ID != m.issueID {    // a new question starts on its default, as the GUI does
 			m.issueID, m.issueSel = m.v.Issue.ID, max(0, slices.Index(m.v.Issue.Issue.Choices, m.v.Issue.Issue.Default))
 		}
 	}
@@ -191,7 +209,7 @@ func (m *Model) key(k tea.KeyMsg) tea.Cmd {
 			m.issueSel = (m.issueSel + 1) % len(ch)
 		case "enter":
 			m.do("answer", "id", iv.ID, "choice", string(ch[m.issueSel]))
-		case "esc": // Esc is the safe answer
+		case "esc", "ctrl+c": // Esc (and Ctrl+C) is the safe answer
 			safe := iv.Issue.Default
 			for _, c := range ch {
 				if c == job.Stop {
@@ -212,9 +230,28 @@ func (m *Model) key(k tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	}
+	if m.leaveAsk != "" {
+		switch s {
+		case "y", "Y", "ctrl+c": // a second Ctrl+C means it
+			k := m.leaveAsk
+			m.leaveAsk = ""
+			if k == "n" {
+				m.do("restart")
+				return nil
+			}
+			return tea.Quit
+		case "n", "N", "esc":
+			m.leaveAsk = ""
+		}
+		return nil
+	}
 	if s == "ctrl+c" {
-		if m.v.Step == app.StepRun {
+		switch m.v.Step {
+		case app.StepRun:
 			m.stopAsk = true
+			return nil
+		case app.StepRecoverList: // a list that may have taken hours: ask first
+			m.leaveAsk = "q"
 			return nil
 		}
 		return tea.Quit
@@ -224,6 +261,10 @@ func (m *Model) key(k tea.KeyMsg) tea.Cmd {
 	}
 	switch s {
 	case "q":
+		if m.v.Step == app.StepRecoverList {
+			m.leaveAsk = "q"
+			return nil
+		}
 		if m.v.Step != app.StepRun {
 			return tea.Quit
 		}
@@ -241,7 +282,8 @@ func (m *Model) key(k tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 	case "esc", "left", "backspace":
-		if m.v.Step != app.StepRun && m.v.Step != app.StepResults {
+		// a stray key never throws away a run's result or a pick list that took long to make
+		if m.v.Step != app.StepRun && m.v.Step != app.StepResults && m.v.Step != app.StepRecoverList {
 			m.do("back")
 		}
 		return nil
@@ -479,6 +521,8 @@ func (m *Model) stepKey(s string) tea.Cmd {
 			m.typing = true
 		case "enter":
 			m.do("recover-start")
+		case "n": // leave the list on purpose, like the GUI's Start over — after asking
+			m.leaveAsk = "n"
 		}
 	case app.StepResults:
 		if s == "enter" {
@@ -493,556 +537,4 @@ func (m *Model) stepKey(s string) tea.Cmd {
 		}
 	}
 	return nil
-}
-
-// ---- view --------------------------------------------------------------------------------------
-
-type palette struct{ ink, steel, signal, safe, risk, fail lipgloss.Style }
-
-func (m *Model) pal() palette {
-	c := func(tok string) lipgloss.Style {
-		t := app.Theme[tok]
-		return lipgloss.NewStyle().Foreground(lipgloss.AdaptiveColor{Light: t[0], Dark: t[1]})
-	}
-	return palette{ink: c("ink"), steel: c("steel"), signal: c("signal"), safe: c("safe"), risk: c("risk"), fail: c("fail")}
-}
-
-func (m *Model) sym(fancy, plain string) string {
-	if m.opt.ASCII {
-		return plain
-	}
-	return fancy
-}
-
-var stepNames = map[app.Step]string{app.StepDrive: "Card", app.StepAction: "What to do", app.StepChoice: "What to copy",
-	app.StepDest: "Where", app.StepOptions: "Options", app.StepReview: "Check", app.StepElevate: "Administrator",
-	app.StepRun: "Working", app.StepRecoverList: "Pick files", app.StepResults: "Done"}
-
-func gb(n int64) string {
-	switch {
-	case n >= 1<<30:
-		return fmt.Sprintf("%.1f GB", float64(n)/(1<<30))
-	case n >= 1<<20:
-		return fmt.Sprintf("%.1f MB", float64(n)/(1<<20))
-	}
-	return fmt.Sprintf("%d KB", (n+1023)/1024)
-}
-
-func commas(n int) string {
-	s := fmt.Sprint(n)
-	for i := len(s) - 3; i > 0; i -= 3 {
-		s = s[:i] + "," + s[i:]
-	}
-	return s
-}
-
-// View draws the screen: header, steps, the current step, help bar. Every line fits the width.
-func (m *Model) View() string {
-	if m.w < 80 || m.h < 24 {
-		return fit("Enlarge the terminal to at least 80×24 (now "+fmt.Sprintf("%d×%d", m.w, m.h)+").", m.w)
-	}
-	p := m.pal()
-	bold := lipgloss.NewStyle().Bold(true)
-	head := bold.Render("SD card doctor")
-	if c := m.v.Card; c != nil {
-		bits := []string{c.Label, c.FS}
-		if c.Total > 0 {
-			bits = append(bits, gb(int64(c.Total)))
-		}
-		head += "  " + strings.Join(nonEmpty(bits), " · ") + "  " + p.safe.Render(m.sym("● ", "* ")+"Only read")
-	} else {
-		head += "  " + p.steel.Render("no card chosen")
-	}
-	steps := m.v.Steps
-	if len(steps) == 0 {
-		steps = []app.Step{app.StepDrive, app.StepAction}
-	}
-	var crumbs []string
-	for i, st := range steps {
-		label := fmt.Sprintf("%d %s", i+1, stepNames[st])
-		if st == m.v.Step {
-			label = p.signal.Bold(true).Render(label)
-		} else {
-			label = p.steel.Render(label)
-		}
-		crumbs = append(crumbs, label)
-	}
-	body := m.body(p)
-	// the problem and busy lines stay on screen however long the page: kept out of the window
-	var tail []string
-	if m.flash != "" {
-		tail = append(tail, "", p.fail.Render(m.sym("✖ ", "x ")+"Problem: ")+m.flash)
-	} else if m.v.Error != "" && m.v.Step != app.StepResults {
-		tail = append(tail, "", p.fail.Render(m.sym("✖ ", "x ")+"Problem: ")+m.v.Error)
-	}
-	if m.v.Busy != "" {
-		tail = append(tail, "", p.steel.Render(m.v.Busy+"…"))
-	}
-	foot := p.steel.Render(m.helpBar())
-	if m.help {
-		foot = p.steel.Render("↑/↓ or j/k move · Enter choose · Esc back · q quit · ? less help — for a screen reader use: aio-sdcard-doctor --plain")
-	}
-	// fit: header, steps, blank, body (windowed around the cursor), blank, help
-	room := m.h - 5
-	body = append(window(body, max(room-len(tail), 1), m.cursorLine), tail...)
-	trail := strings.Join(crumbs, p.steel.Render(m.sym(" › ", " > ")))
-	if lipgloss.Width(trail) > m.w { // too long for this width: say where we are in words
-		at := 0
-		for i, st := range steps {
-			if st == m.v.Step {
-				at = i
-			}
-		}
-		trail = p.signal.Bold(true).Render(fmt.Sprintf("Step %d of %d · %s", at+1, len(steps), stepNames[m.v.Step]))
-		if at+1 < len(steps) {
-			trail += p.steel.Render(" · next: " + stepNames[steps[at+1]])
-		}
-	}
-	lines := append([]string{head, trail, ""}, body...)
-	for len(lines) < m.h-1 {
-		lines = append(lines, "")
-	}
-	lines = append(lines[:m.h-1], foot)
-	for i := range lines {
-		lines[i] = fit(lines[i], m.w)
-	}
-	view := strings.Join(lines, "\n")
-	if m.v.Issue != nil {
-		view = m.overlay(p)
-	}
-	if m.stopAsk {
-		view = m.stopOverlay(p)
-	}
-	return view
-}
-
-func nonEmpty(s []string) []string {
-	var out []string
-	for _, x := range s {
-		if x != "" {
-			out = append(out, x)
-		}
-	}
-	return out
-}
-
-func fit(s string, w int) string {
-	if lipgloss.Width(s) <= w {
-		return s
-	}
-	return ansi.Truncate(s, w, "…")
-}
-
-// window keeps the lines that fit, around the cursor's line.
-func window(body []string, room int, cursor int) []string {
-	if len(body) <= room {
-		return body
-	}
-	start := max(0, min(cursor-room/2, len(body)-room))
-	return body[start : start+room]
-}
-
-func (m *Model) helpBar() string {
-	switch {
-	case m.typing:
-		return "type · Enter OK · Esc cancel"
-	case m.field > 0:
-		return "type · Tab next field · Enter change the card · Esc stop typing"
-	}
-	switch m.v.Step {
-	case app.StepDrive:
-		return "↑/↓ move · Enter choose · s system · p folder/image · r refresh · q quit · ? help"
-	case app.StepReview:
-		h := "Enter start · e change folder · Esc back · q quit"
-		if m.v.Req.Action == "fix" { // card tools have no folder
-			h = "Enter start · Esc back · q quit"
-		}
-		if m.v.Confirm != nil {
-			h = "Tab type label and size · " + h
-		}
-		if m.hasWarnings() { // first: the end of a long help line is what a narrow terminal cuts
-			h = "a accept warnings · " + h
-		}
-		return h
-	case app.StepRun:
-		return "Ctrl+C or x stop · the copy keeps going if you just wait"
-	case app.StepRecoverList:
-		return "↑/↓ move · Space tick · a tick all · / filter · Enter recover ticked · Esc back"
-	case app.StepResults:
-		return "Enter choose · n start over · q quit"
-	}
-	return "↑/↓ move · Enter choose · Esc back · q quit · ? help"
-}
-
-func (m *Model) hasWarnings() bool {
-	if m.v.Plan == nil {
-		return false
-	}
-	for _, is := range m.v.Plan.Issues {
-		if is.Severity == job.Warn {
-			return true
-		}
-	}
-	return false
-}
-
-func (m *Model) mark(i int) string {
-	if i == m.cur {
-		return m.sym("› ", "> ")
-	}
-	return "  "
-}
-
-func (m *Model) body(p palette) []string {
-	v := m.v
-	var b []string
-	h1 := func(s string) { b = append(b, lipgloss.NewStyle().Bold(true).Render(s)) }
-	m.cursorLine = 0
-	switch v.Step {
-	case app.StepDrive:
-		h1("Choose the card")
-		b = append(b, p.steel.Render("Nothing on the card is changed unless you choose Card tools later and confirm."), "")
-		if len(v.Drives) == 0 || !v.Drives[0].Removable {
-			b = append(b, p.risk.Render(m.sym("▲ ", "! "))+"Insert the card — it will appear here automatically.", "")
-		}
-		for i, d := range v.Drives {
-			var tags []string
-			if d.Removable {
-				tags = append(tags, p.safe.Render("Removable"))
-			}
-			if d.System {
-				tags = append(tags, p.risk.Render("System"))
-			}
-			if d.Locked {
-				tags = append(tags, p.fail.Render("Locked"))
-			}
-			if d.WriteProtected {
-				tags = append(tags, "Write-protected")
-			}
-			if d.RAW {
-				tags = append(tags, p.risk.Render("File system not readable"))
-			}
-			if i == m.cur {
-				m.cursorLine = len(b)
-			}
-			b = append(b, fmt.Sprintf("%s%-14s %-6s %-6s %9s  %s", m.mark(i), d.Label, d.Root, d.FS, gb(int64(d.Total)), strings.Join(tags, " ")))
-		}
-		if v.HiddenSystem > 0 {
-			b = append(b, "", p.steel.Render(fmt.Sprintf("%d system drive hidden — press s to show", v.HiddenSystem)))
-		}
-		if m.typing {
-			b = append(b, "", "Folder or image file: "+m.text+m.sym("▏", "_"))
-		} else {
-			b = append(b, "", p.steel.Render("Press p to use a folder or a card image file instead."))
-		}
-	case app.StepAction:
-		h1("What do you want to do?")
-		b = append(b, "")
-		for i, it := range m.actionList() {
-			if i == m.cur {
-				m.cursorLine = len(b)
-			}
-			switch {
-			case it.quick:
-				b = append(b, m.mark(i)+p.signal.Bold(true).Render("Copy everything off this card"), "    "+p.steel.Render("Every file, nothing skipped — you'll check the details before it starts"), "")
-			case !it.row.Enabled:
-				b = append(b, m.mark(i)+p.steel.Render(it.row.Label+" (not available)"), "    "+p.risk.Render(it.row.Reason))
-			case it.row.Danger:
-				b = append(b, "", m.mark(i)+p.fail.Bold(true).Render(it.row.Label), "    "+p.steel.Render(it.row.Desc))
-			default:
-				b = append(b, m.mark(i)+it.row.Label, "    "+p.steel.Render(it.row.Desc))
-			}
-		}
-	case app.StepChoice:
-		h1("What should be copied?")
-		b = append(b, p.steel.Render("Files left out are still listed in the report, with the reason."), "")
-		for i, c := range v.Choices {
-			if i == m.cur {
-				m.cursorLine = len(b)
-			}
-			b = append(b, fmt.Sprintf("%s%-16s %s files · %s", m.mark(i), c.Title, commas(c.Files), gb(c.Bytes)), "    "+p.steel.Render(c.Desc))
-		}
-	case app.StepDest:
-		if v.Req.Action == "image" {
-			h1("Where should the image file go?")
-		} else {
-			h1("Where should the files go?")
-		}
-		b = append(b, p.steel.Render("A folder on another disk — never on the card itself."), "", "Folder: "+m.text+m.sym("▏", "_"))
-	case app.StepOptions:
-		h1("Options")
-		b = append(b, "")
-		for i, o := range m.optionList() {
-			if i == m.cur {
-				m.cursorLine = len(b)
-			}
-			switch {
-			case o.name == "continue":
-				b = append(b, "", m.mark(i)+p.signal.Bold(true).Render("Continue"))
-			case o.text:
-				val := o.value
-				if m.typing && m.item == i {
-					val = m.text + m.sym("▏", "_")
-				}
-				b = append(b, m.mark(i)+o.label+": "+val)
-			default:
-				box := "[ ] "
-				if o.radio {
-					box = "( ) "
-					if o.on {
-						box = "(•) "
-					}
-				} else if o.on {
-					box = "[x] "
-				}
-				if o.off && !o.on {
-					b = append(b, m.mark(i)+p.steel.Render(box+o.label+" (not available)"), "    "+p.risk.Render(o.why))
-					break
-				}
-				line := m.mark(i) + box + o.label
-				if o.hint != "" {
-					line += "  " + p.steel.Render(o.hint)
-				}
-				b = append(b, line)
-				if o.off {
-					b = append(b, "    "+p.risk.Render(o.why))
-				}
-			}
-		}
-	case app.StepReview:
-		h1("Please check before it starts")
-		if v.Plan == nil {
-			break
-		}
-		for _, l := range v.Plan.Summary {
-			b = append(b, "  "+l)
-		}
-		if len(v.Plan.Result) > 0 {
-			b = append(b, "", lipgloss.NewStyle().Bold(true).Render("You'll get"))
-			for _, l := range v.Plan.Result {
-				b = append(b, "  "+l)
-			}
-		}
-		warns := 0
-		for _, is := range v.Plan.Issues {
-			switch {
-			case is.Severity == job.Block && is.Kind != "needs-admin":
-				b = append(b, "", p.fail.Render(m.sym("✖ ", "x ")+"Can't start: ")+is.Title, "    "+is.Detail)
-			case is.Severity == job.Warn:
-				warns++
-				b = append(b, "", p.risk.Render(m.sym("▲ ", "! ")+"Warning: ")+is.Title, "    "+is.Detail)
-			default:
-				b = append(b, "", p.steel.Render("Note: ")+is.Title)
-			}
-		}
-		if v.CanStartOver {
-			box := "[ ]"
-			if v.Req.Fresh {
-				box = "[x]"
-			}
-			b = append(b, "", box+" Start over instead of continuing where it stopped (press o)")
-		}
-		if warns > 0 {
-			box := "[ ]"
-			if m.accept {
-				box = "[x]"
-			}
-			b = append(b, "", box+" I've read the warnings and want to go ahead (press a)")
-		}
-		if c := v.Confirm; c != nil {
-			cursor := func(f int) string {
-				if m.field == f {
-					return m.sym("▏", "_")
-				}
-				return ""
-			}
-			b = append(b, "", p.fail.Bold(true).Render("Type the card's label and size to confirm")+" — this changes the card",
-				fmt.Sprintf("  Label (%s): %s%s", c.Label, m.label, cursor(1)),
-				fmt.Sprintf("  Size (%s): %s%s", c.Size, m.size, cursor(2)))
-		}
-	case app.StepElevate:
-		h1("This needs administrator rights")
-		b = append(b, "Reading the card directly needs them. Quit and run:", "", "  "+v.Instruction)
-	case app.StepRun:
-		h1(nonEmptyOr(v.RunLabel, "Working"))
-		pr := v.Progress
-		if pr == nil {
-			pr = &job.Progress{}
-		}
-		safe := pr.Counters["OK"] + pr.Counters["ALREADY-COPIED"] + pr.Counters["DELETED-RECOVERED"] + pr.Counters["CARVED"]
-		pct := 0
-		if pr.Total > 0 {
-			pct = int(100 * pr.Done / pr.Total)
-		}
-		hero := fmt.Sprintf("%s files safe so far", commas(safe))
-		if v.Plan != nil && v.Plan.Items > 0 {
-			hero = fmt.Sprintf("%s of %s files safe so far", commas(safe), commas(v.Plan.Items))
-		}
-		barW := min(m.w-12, 60)
-		fill := barW * pct / 100
-		bar := strings.Repeat(m.sym("█", "#"), fill) + strings.Repeat(m.sym("░", "-"), barW-fill)
-		b = append(b, lipgloss.NewStyle().Bold(true).Render(hero), "", p.signal.Render(bar)+fmt.Sprintf(" %d%%", pct),
-			fmt.Sprintf("%s of %s", gb(pr.Done), gb(pr.Total)))
-		if pr.BPS > 0 {
-			b[len(b)-1] += fmt.Sprintf(" · %.1f MB/s", pr.BPS/1e6)
-		}
-		if pr.Item != "" {
-			b = append(b, p.steel.Render(middle(pr.Item, m.w-4)))
-		}
-		if pr.Note != "" {
-			b = append(b, p.risk.Render(m.sym("▲ ", "! ")+pr.Note))
-		}
-		if n := len(v.Logs); n > 0 {
-			b = append(b, "")
-			for _, l := range v.Logs[max(0, n-6):] {
-				b = append(b, p.steel.Render(l))
-			}
-		}
-	case app.StepRecoverList:
-		h1("Pick the files to bring back")
-		rv := v.Recover
-		if rv == nil {
-			break
-		}
-		shown := commas(rv.Shown) + " match"
-		if rv.Listed < rv.Shown { // only a page is listed: say so, and how to reach the rest
-			shown += fmt.Sprintf(" (first %s listed — / to filter, a ticks all %s)", commas(rv.Listed), commas(rv.Shown))
-		}
-		b = append(b, p.steel.Render(fmt.Sprintf("%s found · %s · %s ticked · unrecoverable files can't be ticked", commas(rv.Total), shown, commas(rv.Ticked))))
-		if m.typing {
-			b = append(b, "Filter: "+m.text+m.sym("▏", "_"))
-		}
-		b = append(b, "")
-		for i, r := range rv.Rows {
-			if i == m.cur {
-				m.cursorLine = len(b)
-			}
-			box := "[ ]"
-			if r.Ticked {
-				box = "[x]"
-			}
-			if !r.Tickable {
-				box = " - "
-			}
-			st := m.state(p, r.State)
-			b = append(b, fmt.Sprintf("%s%s %s %-24s %9s  %s", m.mark(i), box, st, r.Path, gb(r.Size), p.steel.Render(r.Comment)))
-		}
-	case app.StepResults:
-		res := v.Result
-		title := "Done"
-		switch {
-		case v.Error != "":
-			title = "Stopped"
-		case res != nil && !res.Clean:
-			title = "Done, with problems"
-		}
-		h1(title)
-		if v.Error != "" {
-			b = append(b, p.fail.Render(m.sym("✖ ", "x "))+v.Error)
-		}
-		if res != nil {
-			var keys []string
-			for k := range res.Counters {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			b = append(b, "")
-			for _, k := range keys {
-				b = append(b, fmt.Sprintf("  %-24s %10s", k, commas(res.Counters[k])))
-			}
-			for _, r := range res.Reports {
-				if r != "" {
-					b = append(b, "", p.steel.Render("Report: ")+r)
-				}
-			}
-		}
-		for _, l := range v.Logs {
-			b = append(b, p.steel.Render(l))
-		}
-		b = append(b, "")
-		for i, n := range v.Next {
-			if i == m.cur {
-				m.cursorLine = len(b)
-			}
-			b = append(b, m.mark(i)+p.signal.Bold(true).Render(n.Label)+"  "+p.steel.Render(n.Why))
-		}
-		if m.cur == len(v.Next) {
-			m.cursorLine = len(b)
-		}
-		b = append(b, m.mark(len(v.Next))+"Start over")
-	}
-	return b
-}
-
-func nonEmptyOr(s, alt string) string {
-	if s == "" {
-		return alt
-	}
-	return s
-}
-
-func (m *Model) state(p palette, st string) string {
-	switch st {
-	case "Excellent":
-		return p.safe.Render(m.sym("●", "*") + " Excellent    ")
-	case "Poor":
-		return p.risk.Render(m.sym("▲", "!") + " Poor         ")
-	}
-	return p.steel.Render(m.sym("○", "o") + " Unrecoverable")
-}
-
-// middle shortens a path in the middle, keeping its start and its file name.
-func middle(s string, w int) string {
-	r := []rune(s)
-	if len(r) <= w || w < 10 {
-		return s
-	}
-	half := (w - 1) / 2
-	return string(r[:half]) + "…" + string(r[len(r)-(w-1-half):])
-}
-
-func (m *Model) overlay(p palette) string {
-	iv := m.v.Issue
-	var btns []string
-	for i, c := range iv.Issue.Choices {
-		l := " " + choiceLabel(c) + " "
-		if i == m.issueSel {
-			l = lipgloss.NewStyle().Reverse(true).Render("[" + choiceLabel(c) + "]")
-		}
-		btns = append(btns, l)
-	}
-	lines := []string{"", lipgloss.NewStyle().Bold(true).Render(p.risk.Render(m.sym("▲ ", "! ")) + iv.Issue.Title)}
-	if iv.Issue.Detail != "" {
-		lines = append(lines, "  "+iv.Issue.Detail)
-	}
-	lines = append(lines, "", "  "+strings.Join(btns, "  "), "", p.steel.Render("  ←/→ choose · Enter answer · Esc the safe choice"))
-	return m.frame(lines)
-}
-
-func (m *Model) stopOverlay(p palette) string {
-	return m.frame([]string{"", lipgloss.NewStyle().Bold(true).Render("Stop now?"),
-		"  The current block is finished and saved; running the same thing again continues where it stopped.",
-		"", "  y stop · n keep going"})
-}
-
-func (m *Model) frame(lines []string) string {
-	for len(lines) < m.h {
-		lines = append(lines, "")
-	}
-	lines = lines[:m.h]
-	for i := range lines {
-		lines[i] = fit(lines[i], m.w)
-	}
-	return strings.Join(lines, "\n")
-}
-
-var choiceLabels = map[job.Choice]string{job.Continue: "Continue", job.Stop: "Stop", job.Retry: "Try again", job.Wait: "Wait for the card",
-	"skip-rest": "Skip the rest (report them failed)", job.Skip: "Skip this file", job.Resume: "Continue where it stopped", job.New: "Start over",
-	job.Elevate: "Restart as administrator", "skip-videos": "Skip videos", job.Image: "Make an image instead"}
-
-func choiceLabel(c job.Choice) string {
-	if l, ok := choiceLabels[c]; ok {
-		return l
-	}
-	return string(c)
 }
