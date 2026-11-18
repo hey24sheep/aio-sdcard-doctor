@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -83,6 +84,9 @@ func TestInterruptedExitIs130(t *testing.T) {
 // Adversarial pass 2 OU4: "Make a full backup image instead" ended the copy with exit 1 and no
 // word on how to make that image.
 func TestImageInsteadSaysHowToMakeTheImage(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip(`drive letters: elsewhere "E:\" is a relative folder on the runner's own disk`)
+	}
 	r := &rescue.Rescue{From: `E:\`, Dest: `D:\rescue`}
 	got := imageInsteadHint(r)
 	want := `aio-sdcard-doctor image --from "E:" --to "` + filepath.Join(`D:\rescue`, "card.img") + `"`

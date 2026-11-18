@@ -32,9 +32,11 @@ func partialCard(t *testing.T) (img string, want int) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	at := bytes.Index(b, []byte("F0150   JPG"))
+	// DCIM's first sector (its "." record): files are written in map order, so a named file can
+	// land in the listing's last sector, where zeros look exactly like the folder's normal end
+	at := bytes.Index(b, []byte(".          \x10"))
 	if at < 0 {
-		t.Fatal("no directory record for F0150.JPG")
+		t.Fatal("no \".\" record for DCIM")
 	}
 	sec := at &^ 511
 	clear(b[sec : sec+512])

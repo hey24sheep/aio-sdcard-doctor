@@ -397,7 +397,11 @@ func TestImageDestinationChecked(t *testing.T) {
 	r.do(t, "select-drive", "root", card.Root)
 	r.do(t, "choose-action", "action", "image")
 	r.waitStep(t, StepDest)
-	for _, p := range []string{card.Root + "card.img", `"` + filepath.Join(t.TempDir(), `x"y`, "card.img") + `"`} {
+	bad := []string{`"` + filepath.Join(t.TempDir(), `x"y`, "card.img") + `"`}
+	if runtime.GOOS == "windows" { // the fake card's root is a drive letter
+		bad = append(bad, card.Root+"card.img")
+	}
+	for _, p := range bad {
 		if err := r.s.Do(Command{Name: "set-dest", Args: map[string]string{"path": p}}); err == nil {
 			t.Fatalf("image file %q accepted", p)
 		}

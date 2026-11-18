@@ -222,6 +222,7 @@ aio-sdcard-doctor tui     [--ascii] [--no-animation] [--no-bell]
 - Post-write checks read through the OS cache. Run Verify after re-plugging for a full check.
 - Scan and Card tools check/repair/format are not resumable (running them again is the resume). Everything else resumes.
 - A compressed (ZIP) copy resumes by whole ZIP parts: if it stops, the part being written (up to 1,000 files or 1 GiB) is dropped and those files are read from the card again. On a failing card, leave compression off.
+- An image stores a sector it couldn't read as zeros. Read from the image, a folder that lost its last listed sector looks complete, so files listed only there are not noticed as missing; the image's `.map` file records where those sectors are. Copying from the card itself reports such a folder.
 - Deep scan recovers contiguous files only. Fragmented files are listed with their offset and reason, not written.
 - Finding deleted files with names works on FAT and exFAT cards. NTFS cards get deep scan only for now.
 - Recovered files are checked before they are written: photos are decoded, and every file's structure must hold together to its end. What sits inside a valid structure (video frames, RAW pixels) is not decoded, so a "Poor" file can still come back partly wrong; the report marks those.

@@ -34,17 +34,23 @@ func TestListContainsSystemDrive(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sys := 0
+	// the OS's own volume is a system drive; so may be others of the system disks (Linux /boot,
+	// /boot/efi), which Card tools must refuse just the same
+	osRoot := "/"
+	if runtime.GOOS == "windows" {
+		osRoot = filepath.VolumeName(os.Getenv("SystemRoot")) + `\`
+	}
+	found := false
 	for _, d := range ds {
 		if d.System {
-			sys++
+			found = found || strings.EqualFold(d.Root, osRoot)
 			if d.Total == 0 || d.FS == "" {
 				t.Errorf("system drive incomplete: %+v", d)
 			}
 		}
 	}
-	if sys != 1 {
-		t.Fatalf("%d system drives in %+v", sys, ds)
+	if !found {
+		t.Fatalf("the OS volume %s isn't marked system in %+v", osRoot, ds)
 	}
 }
 

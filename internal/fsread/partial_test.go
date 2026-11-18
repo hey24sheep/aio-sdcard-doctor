@@ -85,6 +85,40 @@ func checkPartial(t *testing.T, src fs.FS, dir string, want int) {
 	}
 }
 
+// CI (adv3): the same damage in the folder's FIRST sector — the one holding "." and ".." —
+// still hid 14 files without a word in an image (the zeroed sector reads as the folder's end).
+func TestFolderFirstSectorLostIsReported(t *testing.T) {
+	img := fatImage(t, "fat32", manyFiles("DCIM", 300))
+	g := geom(img, "fat32")
+	off := g.data + (firstClus(entry(t, img, "DCIM       "), g)-2)*g.cs
+	if img[off] != '.' {
+		t.Fatalf("DCIM's first sector doesn't start with its \".\" record")
+	}
+	lost := 0
+	for k := off; k < off+512; k += 32 {
+		if img[k] != 0 && img[k] != '.' && img[k+11] != 0x0F {
+			lost++
+		}
+	}
+	want := 300 - lost
+	t.Run("unreadable", func(t *testing.T) {
+		src, err := Open(badAreas{bytes.NewReader(img), [][2]int64{{off, off + 512}}}, Volume{FS: "fat32", Size: int64(len(img))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkPartial(t, src, "DCIM", want)
+	})
+	t.Run("zeroed in an image", func(t *testing.T) {
+		z := append([]byte(nil), img...)
+		clear(z[off : off+512])
+		src, err := Open(bytes.NewReader(z), Volume{FS: "fat32", Size: int64(len(z))})
+		if err != nil {
+			t.Fatal(err)
+		}
+		checkPartial(t, src, "DCIM", want)
+	})
+}
+
 // OR1: one unreadable sector in a folder's second cluster hid that folder's files with no error.
 func TestUnreadableFolderSectorIsReported(t *testing.T) {
 	img := fatImage(t, "fat32", manyFiles("DCIM", 300))
